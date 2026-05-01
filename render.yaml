@@ -62,3 +62,7 @@ services:
         sync: false
       - key: AXIS_ENV_ID
         sync: false
+      - key: AXIS_API_URL
+        sync: false                  # e.g. https://axis-api.onrender.com/task
+      - key: WHISPER_MODEL
+        value: small                 # tiny|base|small|medium — large-v3 needs >512MB RAM
