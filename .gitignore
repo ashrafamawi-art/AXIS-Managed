@@ -1,0 +1,8 @@
+credentials.json
+.env
+*.key
+.axis_agent_id
+.axis_env_id
+.axis_session_id
+__pycache__/
+*.pyc
