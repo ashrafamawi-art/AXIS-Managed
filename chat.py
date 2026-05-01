@@ -119,9 +119,12 @@ def _get_or_create_session(agent_id: str, env_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _tool_send_notification(title: str, message: str, **_) -> str:
-    safe = lambda s: s.replace('"', '\\"').replace("'", "\\'")
+    import re
+    # Strip non-ASCII (emoji, special Unicode) — osascript chokes on them
+    clean = lambda s: re.sub(r"[^\x00-\x7F]+", "", s).replace('"', '\\"').strip()
+    t, m = clean(title), clean(message)
     r = subprocess.run(
-        ["osascript", "-e", f'display notification "{safe(message)}" with title "{safe(title)}"'],
+        ["osascript", "-e", f'display notification "{m}" with title "{t}"'],
         capture_output=True, text=True,
     )
     return f"Sent: {title!r}" if r.returncode == 0 else f"Failed: {r.stderr.strip()}"
@@ -213,9 +216,16 @@ Call no tools if nothing actionable is needed (e.g., a simple factual question).
 
 async def _stream_axis_response(session_id: str, task: str,
                                 cl_msg: cl.Message) -> str:
-    loop   = asyncio.get_event_loop()
+    # get_running_loop() is required here — get_event_loop() does not return
+    # the correct loop when called from inside a running Chainlit async handler.
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     chunks: list[str] = []
+
+    def _put(item):
+        # Fire-and-forget — queue.put() is O(1) and never blocks;
+        # calling .result() here would deadlock while the loop drains the queue.
+        asyncio.run_coroutine_threadsafe(queue.put(item), loop)
 
     def _sync_run():
         try:
@@ -231,31 +241,25 @@ async def _stream_axis_response(session_id: str, task: str,
                         }],
                         betas=[BETA],
                     )
-                t = threading.Thread(target=_send, daemon=True)
-                t.start()
+                sender = threading.Thread(target=_send, daemon=True)
+                sender.start()
 
                 for event in stream:
                     etype = getattr(event, "type", None)
                     if etype == "agent.message":
                         for block in getattr(event, "content", []):
                             if getattr(block, "type", None) == "text":
-                                asyncio.run_coroutine_threadsafe(
-                                    queue.put(("chunk", block.text)), loop
-                                ).result()
+                                _put(("chunk", block.text))
                     elif etype == "session.status_idle":
                         break
                     elif etype == "session.status_terminated":
                         SESSION_ID_FILE.unlink(missing_ok=True)
                         break
-                t.join()
+                sender.join()
         except Exception as exc:
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("error", str(exc))), loop
-            ).result()
+            _put(("error", str(exc)))
         finally:
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("done", None)), loop
-            ).result()
+            _put(("done", None))
 
     thread = threading.Thread(target=_sync_run, daemon=True)
     thread.start()
@@ -352,8 +356,15 @@ async def on_start():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    session_id: str      = cl.user_session.get("session_id")
+    session_id: str         = cl.user_session.get("session_id")
     memory:     MemoryStore = cl.user_session.get("memory")
+
+    if not session_id or memory is None:
+        await cl.Message(
+            content="⚠️ AXIS session not initialised. Refresh the page to reconnect."
+        ).send()
+        return
+
     task = message.content.strip()
     if not task:
         return
@@ -361,27 +372,32 @@ async def on_message(message: cl.Message):
     ts = datetime.now(timezone.utc).isoformat()
 
     # Prepend memory context to task if we have prior entries
-    mem_ctx = memory.recent_context()
+    mem_ctx    = memory.recent_context()
     axis_input = f"{task}\n\n{mem_ctx}" if mem_ctx else task
 
     # ── 1. Stream AXIS response ───────────────────────────────────────────
     axis_msg = cl.Message(content="", author="AXIS")
     await axis_msg.send()
 
-    axis_response = await _stream_axis_response(session_id, axis_input, axis_msg)
+    try:
+        axis_response = await _stream_axis_response(session_id, axis_input, axis_msg)
+    except Exception as exc:
+        await axis_msg.stream_token(f"\n\n⚠️ Stream error: {exc}")
+        axis_response = ""
+
     await axis_msg.update()
 
     if not axis_response:
         return
 
     # ── 2. Autonomous executor ────────────────────────────────────────────
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     results: list[dict] = await loop.run_in_executor(
         None, _run_executor_sync, task, axis_response
     )
 
     if results:
-        async with cl.Step(name="Executor", type="tool") as step:
+        async with cl.Step(name="⚙️ Executor", type="tool") as step:
             lines = []
             for r in results:
                 icon = "✅" if r["ok"] else "❌"
