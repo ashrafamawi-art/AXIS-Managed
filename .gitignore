@@ -1,8 +1,12 @@
 credentials.json
+token.pickle
 .env
 *.key
+.telegram_token
 .axis_agent_id
 .axis_env_id
 .axis_session_id
+memory.json
+tasks.md
 __pycache__/
 *.pyc
