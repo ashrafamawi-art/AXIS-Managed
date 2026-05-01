@@ -42,8 +42,13 @@ BETA            = "managed-agents-2026-04-01"
 EXECUTOR_MODEL  = "claude-sonnet-4-6"
 MAX_FEEDBACK    = 2       # max feedback iterations per task
 
-api_key = open(os.path.expanduser("~/.anthropic_key")).read().strip()
-client  = anthropic.Anthropic(api_key=api_key)
+try:
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or open(
+        os.path.expanduser("~/.anthropic_key")
+    ).read().strip()
+except OSError:
+    raise RuntimeError("ANTHROPIC_API_KEY env var not set and ~/.anthropic_key not found.")
+client = anthropic.Anthropic(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------

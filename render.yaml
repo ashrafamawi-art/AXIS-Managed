@@ -1,0 +1,64 @@
+services:
+  # ── Chainlit web UI ────────────────────────────────────────────────────────
+  - type: web
+    name: axis-chat
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: chainlit run chat.py --port $PORT --host 0.0.0.0
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false                  # set manually in Render dashboard
+      - key: AXIS_AGENT_ID
+        sync: false
+      - key: AXIS_ENV_ID
+        sync: false
+      - key: AXIS_SESSION_ID
+        sync: false                  # optional: pin to an existing session
+      - key: GOOGLE_TOKEN_JSON
+        sync: false                  # JSON string from: python3 -c "import pickle,json; c=pickle.load(open('token.pickle','rb')); print(c.to_json())"
+      - key: GCAL_REDIRECT_URI
+        sync: false                  # e.g. https://axis-chat.onrender.com/oauth2callback
+      - key: AXIS_DATA_DIR
+        value: /tmp/axis             # writable scratch space on Render
+
+  # ── AXIS REST API ─────────────────────────────────────────────────────────
+  - type: web
+    name: axis-api
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: AXIS_AGENT_ID
+        sync: false
+      - key: AXIS_ENV_ID
+        sync: false
+      - key: AXIS_SESSION_ID
+        sync: false
+      - key: AXIS_DATA_DIR
+        value: /tmp/axis
+
+  # ── Telegram bot worker ────────────────────────────────────────────────────
+  - type: worker
+    name: axis-telegram
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_bot.py
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_USER_ID
+        sync: false
+      - key: AXIS_AGENT_ID
+        sync: false
+      - key: AXIS_ENV_ID
+        sync: false
