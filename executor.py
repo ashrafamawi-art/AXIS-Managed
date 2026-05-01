@@ -36,7 +36,9 @@ def _send_notification(title: str, message: str, **_) -> str:
         return f"Notification queued (no display): {title!r}"
 
 
-def _save_task(task: str, priority: str = "medium", due: str = "", **_) -> str:
+def _save_task(task: str = "", priority: str = "medium", due: str = "", **extra) -> str:
+    if not task:
+        task = next((str(v) for v in extra.values() if isinstance(v, str)), "Untitled task")
     _TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not _TASKS_FILE.exists():
         _TASKS_FILE.write_text("# AXIS Tasks\n\n")
