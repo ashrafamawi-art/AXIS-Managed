@@ -425,11 +425,38 @@ def _gh_dispatch(name: str, inp: dict) -> str:
         title = inp.get("title", "AXIS: Proposed changes")
         body  = inp.get("body", "Automated PR from AXIS GitHub Agent — please review before merging.")
 
-        # Ensure ai-dev branch exists before trying to open a PR against it
+        # Ensure ai-dev branch exists
         try:
             _gh_ensure_ai_dev(repo)
         except RuntimeError as exc:
             return json.dumps({"error": str(exc)})
+
+        # GitHub rejects PRs with no commits ahead of base. Guarantee at least
+        # one commit on ai-dev by writing a pr-notes.md file with PR metadata.
+        ts            = datetime.now(timezone.utc).isoformat()
+        notes_content = f"# AXIS PR Notes\n\n**Title:** {title}\n\n**Opened:** {ts}\n\n{body}\n"
+        notes_b64     = base64.b64encode(notes_content.encode()).decode()
+
+        # Fetch existing file SHA so we can update rather than create
+        existing = requests.get(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/pr-notes.md?ref={_GH_BRANCH}",
+            headers=headers, timeout=10,
+        )
+        notes_payload: dict = {
+            "message": f"chore: AXIS PR notes — {title[:60]}",
+            "content": notes_b64,
+            "branch":  _GH_BRANCH,
+        }
+        if existing.status_code == 200:
+            notes_payload["sha"] = existing.json()["sha"]
+
+        notes_r = requests.put(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/pr-notes.md",
+            headers=headers, json=notes_payload, timeout=15,
+        )
+        if notes_r.status_code not in (200, 201):
+            return json.dumps({"error": f"Failed to commit to ai-dev: {notes_r.text}"})
+        _gh_log("write_commit", f"{repo}/pr-notes.md@{_GH_BRANCH}")
 
         r = requests.post(
             f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/pulls",
