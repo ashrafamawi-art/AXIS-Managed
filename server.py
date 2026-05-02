@@ -29,6 +29,7 @@ from pydantic import BaseModel
 
 import council
 import executor
+import maestro
 
 # ---------------------------------------------------------------------------
 # Config
@@ -220,7 +221,7 @@ async def post_task(req: TaskRequest):
         raise HTTPException(status_code=400, detail="task must not be empty")
     try:
         loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _run_pipeline, req.task.strip())
+        result = await loop.run_in_executor(None, maestro.run, req.task.strip(), client)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
