@@ -424,6 +424,13 @@ def _gh_dispatch(name: str, inp: dict) -> str:
         repo  = inp["repo"]
         title = inp.get("title", "AXIS: Proposed changes")
         body  = inp.get("body", "Automated PR from AXIS GitHub Agent — please review before merging.")
+
+        # Ensure ai-dev branch exists before trying to open a PR against it
+        try:
+            _gh_ensure_ai_dev(repo)
+        except RuntimeError as exc:
+            return json.dumps({"error": str(exc)})
+
         r = requests.post(
             f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/pulls",
             headers=headers,
@@ -431,7 +438,8 @@ def _gh_dispatch(name: str, inp: dict) -> str:
             timeout=15,
         )
         if r.status_code not in (200, 201):
-            return json.dumps({"error": r.text})
+            err = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
+            return json.dumps({"error": err})
         pr_url = r.json().get("html_url", "")
         _gh_log("create_pull_request", f"{repo} → {pr_url}")
         return json.dumps({"status": "ok", "pr_url": pr_url})
