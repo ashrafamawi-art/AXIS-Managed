@@ -197,7 +197,6 @@ def research_agent(task: str, client: anthropic.Anthropic) -> dict:
             ),
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": task}],
-            betas=["web-search-2025-03-05"],
         )
         answer = " ".join(
             block.text
