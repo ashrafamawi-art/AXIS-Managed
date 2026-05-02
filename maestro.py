@@ -529,23 +529,22 @@ def _gh_fetch_for_task(task: str) -> dict:
 
 # GitHub Developer Agent — reads via API only
 def github_agent(task: str, client: anthropic.Anthropic) -> dict:
+    import requests as _req, base64 as _b64
+
     token = os.environ.get("GITHUB_TOKEN", "")
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept":        "application/vnd.github+json",
     }
 
-    # Always read maestro.py from AXIS-Managed via GitHub REST API
     url = "https://api.github.com/repos/ashrafamawi-art/AXIS-Managed/contents/maestro.py"
-    r = requests.get(url, headers=headers, timeout=15)
+    r = _req.get(url, headers=headers)
 
     if r.status_code != 200:
-        return {"answer": f"GitHub API error: {r.status_code} - {r.text}", "artifacts": {}}
+        return {"answer": f"GitHub error {r.status_code}", "artifacts": {}}
 
-    content = base64.b64decode(r.json()["content"]).decode("utf-8")
-    _gh_log("read_file", f"AXIS-Managed/maestro.py ({len(content)} chars)")
+    content = _b64.b64decode(r.json()["content"]).decode("utf-8")
 
-    # Ask Claude to analyze the fetched content
     resp = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=2000,

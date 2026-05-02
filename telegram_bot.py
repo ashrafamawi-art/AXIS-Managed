@@ -53,7 +53,10 @@ if not api_key:
     raise RuntimeError("ANTHROPIC_API_KEY not set")
 client  = anthropic.Anthropic(api_key=api_key)
 
-AUTHORIZED_UID: int = int(_require("TELEGRAM_USER_ID", Path.home() / ".telegram_user_id"))
+_uid = os.environ.get("TELEGRAM_USER_ID", "")
+if not _uid:
+    raise RuntimeError("TELEGRAM_USER_ID not set")
+AUTHORIZED_UID: int = int(_uid)
 
 
 def _authorized(update: Update) -> bool:
@@ -236,7 +239,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def main():
-    token = _require("TELEGRAM_TOKEN", Path.home() / ".telegram_token")
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN not set")
     print(f"[AXIS Telegram] Starting — authorized UID: {AUTHORIZED_UID}")
     print(f"[AXIS Telegram] AXIS API: {AXIS_API_URL}")
     print(f"[AXIS Telegram] Whisper model: {WHISPER_MODEL}")
