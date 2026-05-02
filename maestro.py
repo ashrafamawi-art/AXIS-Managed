@@ -5,13 +5,10 @@ Every request flows through:
   task
     → security.inspect_prompt()          ← BLOCK if HIGH risk
     → classify intent                    ← haiku classifier
-    → detect agents needed               ← keyword-based multi-agent detection
-    → run agent(s)                       ← one or many in parallel
-    → merge results                      ← unified answer + artifacts
+    → build execution plan               ← haiku orchestrator (which agents, order, deps)
+    → execute plan (DAG-based)           ← parallel-capable multi-agent execution
+    → synthesize results                 ← unified answer from all step outputs
     → return unified response
-
-Single-agent requests behave exactly as before.
-Multi-agent requests run all needed agents and merge their outputs.
 """
 
 import base64
@@ -61,6 +58,59 @@ You are the AXIS Intent Classifier. Classify the request into exactly one catego
 - task     : to-do items, action items, reminders, follow-ups, things to do later
 - memory   : "remember", "recall", "what did I tell you", storing/retrieving facts
 - general  : everything else — questions, analysis, writing, advice, projects
+
+Return JSON only.
+"""
+
+# ---------------------------------------------------------------------------
+# Orchestrator plan schema
+# ---------------------------------------------------------------------------
+
+_PLAN_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id":          {"type": "string"},
+                    "agent":       {
+                        "type": "string",
+                        "enum": ["calendar", "task", "memory", "general", "research", "github"],
+                    },
+                    "description": {"type": "string"},
+                    "input":       {"type": "string"},
+                    "depends_on":  {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["id", "agent", "description", "input", "depends_on"],
+            },
+        },
+        "rationale": {"type": "string"},
+    },
+    "required": ["steps", "rationale"],
+}
+
+_PLAN_SYSTEM = """\
+You are the AXIS Orchestrator. Given a user task, produce a minimal execution plan.
+
+Available agents:
+- calendar  : scheduling, meetings, events, appointments
+- task      : saving to-do items and action items
+- memory    : recall prior interactions and stored facts
+- general   : reasoning, writing, analysis, Q&A, coding — handles calendar execution too
+- research  : web search for current information
+- github    : GitHub operations (read/write code, open PRs)
+
+Rules:
+1. Most tasks need ONE step with agent=general. Default to that.
+2. Use multiple steps only when the task genuinely requires distinct agents
+   (e.g. "search the web then save as a task" → research step, then task step).
+3. Set depends_on=[] for steps that can run in parallel.
+4. Set depends_on=[prior_step_id] when you need the output of a prior step as input.
+5. Keep it minimal — 1 step is usually correct.
 
 Return JSON only.
 """
@@ -621,98 +671,132 @@ _AGENT_MAP = {
     "github":   github_agent,
 }
 
-# Keywords that signal each domain is needed.
-# Substring match on lowercased task text — order doesn't matter.
-_DOMAIN_KEYWORDS: dict[str, list[str]] = {
-    "calendar": ["calendar", "schedule", "meeting", "event", "appointment", "availability"],
-    "task":     ["task", "to-do", "todo", "remind", "reminder", "follow-up", "action item"],
-    "memory":   ["remember", "recall", "what did i tell", "told you", "from memory"],
-    "research": [
-        # Arabic
-        "ابحث", "بحث", "اخبار", "اخبرني عن", "شو اخر", "ما هو", "معلومات",
-        # English
-        "search", "find", "what is", "latest", "news",
-    ],
-    "github": [
-        "github", "repo", "branch", "pull request", "pr", "open pr",
-        "merge", "commit", "push", "maestro", "axis-managed",
-    ],
-}
+# ---------------------------------------------------------------------------
+# Orchestrator: plan → execute → synthesize
+# ---------------------------------------------------------------------------
+
+def _build_plan(task: str, client: anthropic.Anthropic) -> dict:
+    """Ask Haiku to produce a DAG execution plan for this task."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=_PLAN_SYSTEM,
+            messages=[{"role": "user", "content": f"Task: {task}"}],
+            output_config={"format": {"type": "json_schema", "schema": _PLAN_SCHEMA}},
+        )
+        plan = json.loads(resp.content[0].text)
+        if plan.get("steps"):
+            return plan
+        raise ValueError("empty steps")
+    except Exception as exc:
+        print(f"[maestro] plan build error: {exc} — using single-step fallback")
+        return {
+            "steps":     [{"id": "s1", "agent": "general", "description": task,
+                           "input": task, "depends_on": []}],
+            "rationale": "fallback",
+        }
 
 
-def _detect_agents(task: str, intent: str) -> list:
+def _execute_plan(plan: dict, task: str, client: anthropic.Anthropic) -> list:
     """
-    Return the list of agent functions needed for this task.
+    Execute the plan DAG. Returns list of step result dicts:
+    [{"id": str, "agent": str, "result": {answer, artifacts, ...}}, ...]
 
-    Strategy:
-      1. Check the lowercased task text against each domain's keywords.
-      2. If two or more domains match → multi-agent: return one function per domain.
-      3. If exactly one domain matches → use that agent directly (bypasses intent
-         classifier — necessary for "research" which the classifier doesn't know about).
-      4. If no domains match → fall back to _AGENT_MAP[intent] from the classifier.
+    Steps with empty depends_on run in parallel; dependent steps receive
+    prior outputs injected into their input before calling the agent.
     """
-    lower = task.lower()
+    steps_by_id: dict[str, dict] = {s["id"]: s for s in plan["steps"]}
+    completed:   dict[str, dict] = {}   # step_id → agent result dict
+    results:     list[dict]      = []
+    remaining:   list[str]       = list(steps_by_id)
 
-    matched_domains = [
-        domain
-        for domain, keywords in _DOMAIN_KEYWORDS.items()
-        if any(kw in lower for kw in keywords)
-    ]
+    def _run_one(sid: str) -> tuple[str, dict]:
+        step      = steps_by_id[sid]
+        agent_fn  = _AGENT_MAP.get(step["agent"], general_agent)
+        enriched  = step["input"]
+        for dep_id in step["depends_on"]:
+            dep_answer = completed.get(dep_id, {}).get("answer", "")
+            if dep_answer:
+                enriched += f"\n\n[Output from {dep_id}: {dep_answer[:500]}]"
+        try:
+            return sid, agent_fn(enriched, client)
+        except Exception as exc:
+            return sid, {"answer": f"⚠️ Agent error: {exc}", "artifacts": {}}
 
-    # Deduplicate while preserving match order
-    seen: set[str] = set()
-    unique_domains: list[str] = []
-    for d in matched_domains:
-        if d not in seen:
-            seen.add(d)
-            unique_domains.append(d)
+    while remaining:
+        ready = [
+            sid for sid in remaining
+            if all(dep in completed for dep in steps_by_id[sid]["depends_on"])
+        ]
+        if not ready:
+            ready = remaining[:]   # break circular deps — run everything left
 
-    if len(unique_domains) >= 2:
-        # Multi-agent: run every matched domain
-        return [_AGENT_MAP[d] for d in unique_domains]
+        if len(ready) == 1:
+            sid, res = _run_one(ready[0])
+            completed[sid] = res
+            results.append({"id": sid, "agent": steps_by_id[sid]["agent"], "result": res})
+        else:
+            wave: list[tuple[str, dict]] = []
+            with ThreadPoolExecutor(max_workers=len(ready)) as pool:
+                futs = {pool.submit(_run_one, sid): sid for sid in ready}
+                for fut in as_completed(futs):
+                    sid, res = fut.result()
+                    wave.append((sid, res))
+            for sid, res in wave:
+                completed[sid] = res
+                results.append({"id": sid, "agent": steps_by_id[sid]["agent"], "result": res})
 
-    if len(unique_domains) == 1:
-        # Single keyword match — trust it over the intent classifier
-        return [_AGENT_MAP[unique_domains[0]]]
+        for sid in ready:
+            remaining.remove(sid)
 
-    # No keyword match — use the intent classifier's verdict
-    return [_AGENT_MAP.get(intent, general_agent)]
+    return results
 
 
-def _merge_results(named_results: list[tuple[str, dict]]) -> dict:
+def _synthesize(task: str, step_results: list, plan: dict,
+                client: anthropic.Anthropic) -> dict:
     """
-    Merge outputs from multiple agents into one result dict.
-
-    named_results: list of (agent_name, agent_result_dict)
-
-    - Answers are joined under bold section headers.
-    - Artifact lists are concatenated; scalar values are overwritten last-wins.
-    - council/plan are taken from the first result that carries them.
+    Merge step results into one agent_result dict.
+    Single-step: return the result directly.
+    Multi-step: ask Haiku to produce a coherent final answer.
     """
-    sections:          list[str] = []
-    merged_artifacts:  dict      = {}
-    extras:            dict      = {}   # council, plan — first-wins
+    if len(step_results) == 1:
+        return step_results[0]["result"]
 
-    for name, result in named_results:
-        answer = (result.get("answer") or "").strip()
+    parts = []
+    for sr in step_results:
+        answer = (sr["result"].get("answer") or "").strip()
         if answer:
-            label = name.replace("_", " ").title()
-            sections.append(f"**{label}**\n{answer}")
+            parts.append(f"[{sr['agent']}]: {answer}")
 
-        for key, val in result.get("artifacts", {}).items():
+    combined = "\n\n".join(parts)
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system="You are AXIS. Synthesize the agent outputs into one clear, concise response.",
+            messages=[{"role": "user",
+                       "content": f"Task: {task}\n\nAgent outputs:\n{combined}"}],
+        )
+        synthesized = resp.content[0].text.strip()
+    except Exception:
+        synthesized = combined
+
+    merged_artifacts: dict = {}
+    for sr in step_results:
+        for key, val in sr["result"].get("artifacts", {}).items():
             if isinstance(val, list):
                 merged_artifacts.setdefault(key, []).extend(val)
             else:
                 merged_artifacts[key] = val
 
+    extras: dict = {}
+    for sr in step_results:
         for key in ("council", "plan"):
-            if key not in extras and key in result:
-                extras[key] = result[key]
+            if key not in extras and key in sr["result"]:
+                extras[key] = sr["result"][key]
 
-    merged = {
-        "answer":    "\n\n---\n\n".join(sections) or "(no response)",
-        "artifacts": merged_artifacts,
-    }
+    merged = {"answer": synthesized, "artifacts": merged_artifacts}
     merged.update(extras)
     return merged
 
@@ -845,37 +929,22 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
         elif _task_rec.intent in _tm.PERSIST_INTENTS:
             _tm.save(_task_rec)
 
-    # ── 3. Detect agents and route ────────────────────────────────────────
-    agents = _detect_agents(actual_task, intent)
+    # ── 3. Build execution plan ───────────────────────────────────────────
+    exec_plan = _build_plan(actual_task, client)
     t0 = time.monotonic()
 
-    if len(agents) == 1:
-        agent_fn = agents[0]
-        try:
-            agent_result = agent_fn(actual_task, client)
-        except Exception as exc:
-            agent_result = {"answer": f"⚠️ Agent error: {exc}", "artifacts": {}}
-        agent_names = [agent_fn.__name__]
-    else:
-        # Run all agents in parallel; isolate failures per agent
-        named: list[tuple[str, dict]] = []
-        with ThreadPoolExecutor(max_workers=len(agents)) as pool:
-            futures = {pool.submit(fn, actual_task, client): fn.__name__ for fn in agents}
-            for fut in as_completed(futures):
-                name = futures[fut]
-                try:
-                    named.append((name, fut.result()))
-                except Exception as exc:
-                    named.append((name, {"answer": f"⚠️ Agent error: {exc}", "artifacts": {}}))
-        agent_result = _merge_results(named)
-        agent_names  = [name for name, _ in named]
-
+    # ── 4. Execute plan (DAG-based, parallel-capable) ─────────────────────
+    step_results = _execute_plan(exec_plan, actual_task, client)
     execution_ms = round((time.monotonic() - t0) * 1000)
 
-    # ── 4. Persist to memory ──────────────────────────────────────────────
+    # ── 5. Synthesize step results ────────────────────────────────────────
+    agent_result = _synthesize(actual_task, step_results, exec_plan, client)
+    agent_names  = [sr["agent"] for sr in step_results]
+
+    # ── 6. Persist to memory ──────────────────────────────────────────────
     _save_memory(actual_task, agent_result.get("answer", ""))
 
-    # ── 5. Build unified response ─────────────────────────────────────────
+    # ── 7. Build unified response ─────────────────────────────────────────
     response: dict = {
         "id":        str(uuid.uuid4()),
         "task":      actual_task,
