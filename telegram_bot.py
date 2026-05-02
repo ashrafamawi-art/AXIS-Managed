@@ -48,7 +48,9 @@ def _require(env: str, fallback_file: Path = None) -> str:
 AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-api_key = _require("ANTHROPIC_API_KEY", Path.home() / ".anthropic_key")
+api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+if not api_key:
+    raise RuntimeError("ANTHROPIC_API_KEY not set")
 client  = anthropic.Anthropic(api_key=api_key)
 
 AUTHORIZED_UID: int = int(_require("TELEGRAM_USER_ID", Path.home() / ".telegram_user_id"))
