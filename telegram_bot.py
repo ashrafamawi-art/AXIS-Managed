@@ -10,6 +10,7 @@ Environment variables:
   TELEGRAM_USER_ID     Authorized user's Telegram numeric ID
   ANTHROPIC_API_KEY    For Claude post-processing of Arabic transcription
   AXIS_API_URL         Full URL of the AXIS /task endpoint
+                       Default: https://axis-api.onrender.com/task
   WHISPER_MODEL        faster-whisper model size (default: small)
                        tiny | base | small | medium | large-v3
 """
@@ -18,6 +19,7 @@ import asyncio
 import os
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
@@ -35,22 +37,13 @@ from telegram.ext import (
 # Config
 # ---------------------------------------------------------------------------
 
-def _require(env: str, fallback_file: Path = None) -> str:
-    val = os.environ.get(env, "")
-    if val:
-        return val
-    if fallback_file and fallback_file.exists():
-        return fallback_file.read_text().strip()
-    raise RuntimeError(f"{env} env var not set" +
-                       (f" and {fallback_file} not found" if fallback_file else "") + ".")
-
-
-AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-managed.onrender.com/task")
+AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
+AXIS_HEALTH_URL = AXIS_API_URL.replace("/task", "/health")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-api_key        = os.environ.get("ANTHROPIC_API_KEY", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
+api_key           = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_USER_ID  = os.environ.get("TELEGRAM_USER_ID", "")
 
 client         = anthropic.Anthropic(api_key=api_key)
 AUTHORIZED_UID = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else 0
@@ -60,26 +53,94 @@ def _authorized(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == AUTHORIZED_UID
 
 
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
 # ---------------------------------------------------------------------------
-# AXIS API call
+# AXIS API call — no fallback, no local Claude response for text
 # ---------------------------------------------------------------------------
 
-def _call_axis_api(text: str) -> str:
-    """Blocking: POST task to AXIS REST API, return the answer string."""
+def _call_axis_api(text: str) -> dict:
+    """
+    Blocking: POST task to AXIS REST API.
+    Returns the full response dict so callers can surface execution artifacts.
+    Raises on HTTP error — caller shows the error to the user directly.
+    """
+    print(f"[{_ts()}] [AXIS Telegram] → POST {AXIS_API_URL}")
+    print(f"[{_ts()}] [AXIS Telegram]   task: {text[:120]!r}")
+
     resp = http_lib.post(AXIS_API_URL, json={"task": text}, timeout=120)
+
+    print(f"[{_ts()}] [AXIS Telegram] ← HTTP {resp.status_code} ({resp.elapsed.total_seconds():.1f}s)")
     resp.raise_for_status()
+
     data = resp.json()
-    return data.get("answer") or data.get("message") or "(no response)"
+    _log_response(data)
+    return data
+
+
+def _log_response(data: dict) -> None:
+    intent  = data.get("routing", {}).get("intent", "?")
+    agents  = data.get("routing", {}).get("agents", [])
+    ms      = data.get("execution_ms", "?")
+    risk    = data.get("security", {}).get("risk", "?")
+    answer  = data.get("answer", "")
+    arts    = data.get("artifacts", {})
+    print(f"[{_ts()}] [AXIS Telegram]   intent={intent}  agents={agents}  "
+          f"risk={risk}  execution_ms={ms}")
+    print(f"[{_ts()}] [AXIS Telegram]   answer: {answer[:100]!r}...")
+    if arts:
+        print(f"[{_ts()}] [AXIS Telegram]   artifacts: {list(arts.keys())}")
+
+
+def _format_response(data: dict) -> str:
+    """
+    Build the Telegram message from the AXIS API response.
+    Shows the answer AND a brief execution summary from artifacts.
+    """
+    answer = data.get("answer") or data.get("message") or "(no response)"
+
+    arts = data.get("artifacts", {})
+    lines: list[str] = []
+
+    # Calendar events created
+    for item in arts.get("calendar", []):
+        if isinstance(item, str):
+            lines.append(f"📅 {item}")
+
+    # Tasks saved
+    for item in arts.get("tasks", []):
+        if isinstance(item, str) and "PENDING CALENDAR" not in item:
+            lines.append(f"✅ {item}")
+
+    # Pending calendar items (calendar creds not set on Render)
+    pending = [
+        item for item in arts.get("tasks", [])
+        if isinstance(item, str) and "PENDING CALENDAR" in item
+    ]
+    if pending:
+        lines.append("⚠️ Calendar credentials not configured on Render — event saved as pending task.")
+
+    # Notifications sent
+    for item in arts.get("notifications", []):
+        if isinstance(item, str):
+            lines.append(f"🔔 {item}")
+
+    suffix = ("\n\n" + "\n".join(lines)) if lines else ""
+    return answer + suffix
 
 
 async def _ask_axis(text: str) -> str:
     """Async wrapper: runs the blocking API call in a thread pool."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _call_axis_api, text)
+    data = await loop.run_in_executor(None, _call_axis_api, text)
+    return _format_response(data)
 
 
 # ---------------------------------------------------------------------------
 # Voice transcription — faster-whisper + Claude post-processing
+# (Claude is used ONLY here, to fix transcription errors, not to generate responses)
 # ---------------------------------------------------------------------------
 
 _whisper_model = None
@@ -123,7 +184,7 @@ def _normalize_audio(input_path: str) -> str:
 
 
 def _fix_transcription(raw: str) -> str:
-    """Claude post-processing: fix Arabic transcription errors and names."""
+    """Claude post-processing: fix Arabic transcription errors and names only."""
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
@@ -149,18 +210,18 @@ def _transcribe(input_path: str) -> str:
             wav_path = _normalize_audio(input_path)
             source   = wav_path
         except Exception:
-            source = input_path  # ffmpeg failed — use original
+            source = input_path
 
         model = _get_whisper_model()
         segments, info = model.transcribe(
             source, language="ar", beam_size=5, vad_filter=True,
         )
         raw = " ".join(seg.text for seg in segments).strip()
-        print(f"[AXIS Telegram] Whisper raw: {len(raw)} chars (lang={info.language})")
+        print(f"[{_ts()}] [AXIS Telegram] Whisper raw: {len(raw)} chars (lang={info.language})")
         if not raw:
             return ""
         fixed = _fix_transcription(raw)
-        print(f"[AXIS Telegram] After correction: {len(fixed)} chars")
+        print(f"[{_ts()}] [AXIS Telegram] After correction: {len(fixed)} chars")
         return fixed
     finally:
         if wav_path:
@@ -184,12 +245,41 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Telegram user ID: {uid}")
 
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check AXIS API connectivity."""
+    if not _authorized(update):
+        return
+    msg = await update.message.reply_text("⏳ Checking AXIS API...")
+    try:
+        r = http_lib.get(AXIS_HEALTH_URL, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            svc  = data.get("service", "AXIS")
+            await msg.edit_text(
+                f"✅ AXIS API is online\n"
+                f"URL: `{AXIS_API_URL}`\n"
+                f"Service: {svc}",
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.edit_text(f"⚠️ AXIS API returned HTTP {r.status_code}\nURL: {AXIS_API_URL}")
+    except Exception as exc:
+        await msg.edit_text(
+            f"❌ AXIS API unreachable\n"
+            f"URL: {AXIS_API_URL}\n"
+            f"Error: {exc}"
+        )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     text = (update.message.text or "").strip()
     if not text:
         return
+
+    uid = update.effective_user.id
+    print(f"[{_ts()}] [AXIS Telegram] text from uid={uid}: {text[:80]!r}")
 
     thinking = await update.message.reply_text("⏳")
     try:
@@ -198,14 +288,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
         await thinking.edit_text(response)
     except Exception as exc:
-        await thinking.edit_text(f"⚠️ Error: {exc}")
+        print(f"[{_ts()}] [AXIS Telegram] ERROR calling AXIS API: {exc}")
+        await thinking.edit_text(
+            f"⚠️ AXIS API error: {exc}\n\n"
+            f"API URL: {AXIS_API_URL}\n"
+            "Use /status to check connectivity."
+        )
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
 
-    status   = await update.message.reply_text("🎙 Transcribing...")
+    uid    = update.effective_user.id
+    status = await update.message.reply_text("🎙 Transcribing...")
     ogg_path = None
     try:
         voice   = update.message.voice
@@ -222,14 +318,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("⚠️ Could not transcribe audio. Please try again.")
             return
 
+        print(f"[{_ts()}] [AXIS Telegram] voice from uid={uid} → transcribed: {text[:80]!r}")
         await status.edit_text(f'🎙 "{text}"\n\n⏳ Asking AXIS...')
+
         response = await _ask_axis(text)
         if len(response) > 4000:
             response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
         await status.edit_text(f'🎙 "{text}"\n\n{response}')
 
     except Exception as exc:
-        await status.edit_text(f"⚠️ Error: {exc}")
+        print(f"[{_ts()}] [AXIS Telegram] ERROR in voice handler: {exc}")
+        await status.edit_text(
+            f"⚠️ Error: {exc}\n\n"
+            f"API URL: {AXIS_API_URL}\n"
+            "Use /status to check connectivity."
+        )
     finally:
         if ogg_path:
             Path(ogg_path).unlink(missing_ok=True)
@@ -239,14 +342,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _check_api_on_startup() -> None:
+    """Log whether the AXIS API is reachable at startup. Non-fatal."""
+    try:
+        r = http_lib.get(AXIS_HEALTH_URL, timeout=10)
+        if r.status_code == 200:
+            print(f"[AXIS Telegram] ✅ AXIS API reachable: {AXIS_HEALTH_URL}")
+        else:
+            print(f"[AXIS Telegram] ⚠️ AXIS API returned HTTP {r.status_code}: {AXIS_HEALTH_URL}")
+    except Exception as exc:
+        print(f"[AXIS Telegram] ⚠️ AXIS API unreachable at startup: {exc}")
+        print(f"[AXIS Telegram]    Messages will fail until the API is online.")
+
+
 def main():
     print(f"[AXIS Telegram] Starting — authorized UID: {AUTHORIZED_UID}")
-    print(f"[AXIS Telegram] AXIS API: {AXIS_API_URL}")
+    print(f"[AXIS Telegram] AXIS API URL : {AXIS_API_URL}")
+    print(f"[AXIS Telegram] Health URL   : {AXIS_HEALTH_URL}")
     print(f"[AXIS Telegram] Whisper model: {WHISPER_MODEL}")
+
+    _check_api_on_startup()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 

@@ -174,9 +174,12 @@ def _run_pipeline(task: str) -> dict:
 
     # 7. Build artifacts
     artifacts: dict = {}
-    notifications = [r["output"] for r in all_results if r["tool"] == "send_notification"]
-    tasks_saved   = [r["output"] for r in all_results if r["tool"] == "save_task"]
-    http_calls    = [r["output"] for r in all_results if r["tool"] == "http_request"]
+    calendar_events = [r["output"] for r in all_results if r["tool"] == "create_calendar_event"]
+    notifications   = [r["output"] for r in all_results if r["tool"] == "send_notification"]
+    tasks_saved     = [r["output"] for r in all_results if r["tool"] == "save_task"]
+    http_calls      = [r["output"] for r in all_results if r["tool"] == "http_request"]
+    if calendar_events:
+        artifacts["calendar"] = calendar_events
     if notifications:
         artifacts["notifications"] = notifications
     if tasks_saved:
