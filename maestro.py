@@ -5,12 +5,13 @@ Every request flows through:
   task
     → security.inspect_prompt()          ← BLOCK if HIGH risk
     → classify intent                    ← haiku classifier
-    → route to agent                     ← calendar / task / memory / general
-    → security.inspect_action()          ← per-subtask veto before execution
+    → detect agents needed               ← keyword-based multi-agent detection
+    → run agent(s)                       ← one or many in parallel
+    → merge results                      ← unified answer + artifacts
     → return unified response
 
-MEDIUM-risk tasks skip intent routing and always go to general_agent
-(full pipeline with maximum oversight).
+Single-agent requests behave exactly as before.
+Multi-agent requests run all needed agents and merge their outputs.
 """
 
 import json
@@ -186,6 +187,86 @@ _AGENT_MAP = {
     "general":  general_agent,
 }
 
+# Keywords that signal each domain is needed.
+# Substring match on lowercased task text — order doesn't matter.
+_DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    "calendar": ["calendar", "schedule", "meeting", "event", "appointment", "availability"],
+    "task":     ["task", "to-do", "todo", "remind", "reminder", "follow-up", "action item"],
+    "memory":   ["remember", "recall", "what did i tell", "told you", "from memory"],
+}
+
+
+def _detect_agents(task: str, intent: str) -> list:
+    """
+    Return the list of agent functions needed for this task.
+
+    Strategy:
+      1. Check the lowercased task text against each domain's keywords.
+      2. If two or more domains match → multi-agent: return one function per domain.
+      3. If zero or one domain matches → single-agent: fall back to _AGENT_MAP[intent].
+
+    This keeps single-agent requests on the exact same path as before.
+    """
+    lower = task.lower()
+
+    matched_domains = [
+        domain
+        for domain, keywords in _DOMAIN_KEYWORDS.items()
+        if any(kw in lower for kw in keywords)
+    ]
+
+    # Deduplicate while preserving match order
+    seen: set[str] = set()
+    unique_domains: list[str] = []
+    for d in matched_domains:
+        if d not in seen:
+            seen.add(d)
+            unique_domains.append(d)
+
+    if len(unique_domains) >= 2:
+        return [_AGENT_MAP[d] for d in unique_domains]
+
+    # Single or no keyword match — use the intent classifier's verdict
+    return [_AGENT_MAP.get(intent, general_agent)]
+
+
+def _merge_results(named_results: list[tuple[str, dict]]) -> dict:
+    """
+    Merge outputs from multiple agents into one result dict.
+
+    named_results: list of (agent_name, agent_result_dict)
+
+    - Answers are joined under bold section headers.
+    - Artifact lists are concatenated; scalar values are overwritten last-wins.
+    - council/plan are taken from the first result that carries them.
+    """
+    sections:          list[str] = []
+    merged_artifacts:  dict      = {}
+    extras:            dict      = {}   # council, plan — first-wins
+
+    for name, result in named_results:
+        answer = (result.get("answer") or "").strip()
+        if answer:
+            label = name.replace("_", " ").title()
+            sections.append(f"**{label}**\n{answer}")
+
+        for key, val in result.get("artifacts", {}).items():
+            if isinstance(val, list):
+                merged_artifacts.setdefault(key, []).extend(val)
+            else:
+                merged_artifacts[key] = val
+
+        for key in ("council", "plan"):
+            if key not in extras and key in result:
+                extras[key] = result[key]
+
+    merged = {
+        "answer":    "\n\n---\n\n".join(sections) or "(no response)",
+        "artifacts": merged_artifacts,
+    }
+    merged.update(extras)
+    return merged
+
 # ---------------------------------------------------------------------------
 # Maestro — main entry point
 # ---------------------------------------------------------------------------
@@ -196,9 +277,9 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
 
     Returns a response dict compatible with POST /task:
     {
-        "id", "task", "status", "answer",
+        "id", "task", "status", "agent", "answer",
         "security": {"risk", "reason"},
-        "routing":  {"intent"},
+        "routing":  {"intent", "agents": [...]},   # agents list length > 1 → multi-agent run
         "council":  {...},   # only for general/calendar
         "plan":     {...},   # only for general/calendar
         "artifacts": {...},
@@ -246,10 +327,19 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
             "timestamp": ts,
         }
 
-    # ── 3. Route to agent ─────────────────────────────────────────────────
-    agent_fn     = _AGENT_MAP.get(intent, general_agent)
-    agent_result = agent_fn(actual_task, client)
-    agent_name   = agent_fn.__name__
+    # ── 3. Detect agents and route ────────────────────────────────────────
+    agents = _detect_agents(actual_task, intent)
+
+    if len(agents) == 1:
+        # Single-agent path — identical to original behavior
+        agent_fn     = agents[0]
+        agent_result = agent_fn(actual_task, client)
+        agent_names  = [agent_fn.__name__]
+    else:
+        # Multi-agent path — run all detected agents, then merge
+        named = [(fn.__name__, fn(actual_task, client)) for fn in agents]
+        agent_result = _merge_results(named)
+        agent_names  = [name for name, _ in named]
 
     # ── 4. Persist to memory ──────────────────────────────────────────────
     _save_memory(actual_task, agent_result.get("answer", ""))
@@ -259,10 +349,10 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
         "id":        str(uuid.uuid4()),
         "task":      actual_task,
         "status":    "done",
-        "agent":     agent_name,
+        "agent":     ", ".join(agent_names),
         "answer":    agent_result.get("answer", "(no response)"),
         "security":  {"risk": sec["risk"], "reason": sec["reason"]},
-        "routing":   {"intent": intent},
+        "routing":   {"intent": intent, "agents": agent_names},
         "artifacts": agent_result.get("artifacts", {}),
         "timestamp": ts,
     }
