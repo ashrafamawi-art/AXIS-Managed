@@ -32,6 +32,7 @@ from pydantic import BaseModel
 import council
 import executor
 import maestro
+import task_manager as _tm
 
 # ---------------------------------------------------------------------------
 # Request-level dedup cache
@@ -254,6 +255,30 @@ class TaskRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "AXIS"}
+
+
+@app.get("/tasks")
+def get_tasks(status: str = None, limit: int = 50):
+    records = _tm.list_tasks(status_filter=status, limit=limit)
+    return {"tasks": [r.to_dict() for r in records], "count": len(records)}
+
+
+@app.get("/tasks/pending")
+def get_pending_tasks():
+    records = _tm.list_tasks(status_filter=_tm.PENDING_CONFIRMATION, limit=20)
+    return {
+        "tasks": [r.to_dict() for r in records],
+        "count": len(records),
+        "formatted": _tm.format_task_list(records, "⏳ *Pending Confirmation*"),
+    }
+
+
+@app.delete("/tasks/{task_id}")
+def cancel_task(task_id: str):
+    ok = _tm.cancel(task_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+    return {"status": "cancelled", "task_id": task_id}
 
 
 @app.post("/task")

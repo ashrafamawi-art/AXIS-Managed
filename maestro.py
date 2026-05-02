@@ -30,6 +30,9 @@ import requests
 import security
 import council
 import executor
+import task_manager as _tm
+
+_SKIP_PREFIX = "__SKIP_CONFIRM__"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -757,9 +760,40 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
     """
     ts = datetime.now(timezone.utc).isoformat()
 
+    # ── -1. Task-manager confirmation handler ─────────────────────────────
+    # If the user said "yes/ok/confirm" (bare), find the latest pending task
+    # and execute it directly (bypassing the proposal gate below).
+    if _tm.is_confirmation_text(task):
+        pending = _tm.get_latest_pending()
+        if pending:
+            _tm.update(pending.task_id, status=_tm.SCHEDULED)
+            result = run(f"{_SKIP_PREFIX}{pending.task_id}__{pending.user_message}", client)
+            outcome = _tm.COMPLETED if result.get("status") == "done" else _tm.FAILED
+            _tm.update(pending.task_id, status=outcome,
+                       execution_result=result.get("answer", "")[:200])
+            result["confirmed_task_id"] = pending.task_id
+            return result
+        return {
+            "id":        str(uuid.uuid4()),
+            "task":      task,
+            "status":    "done",
+            "answer":    "No pending task found to confirm.",
+            "security":  {"risk": "low", "reason": ""},
+            "routing":   {"intent": "general", "agents": []},
+            "artifacts": {},
+            "timestamp": ts,
+        }
+
+    # Strip the internal skip-confirm prefix injected by the handler above.
+    skip_confirm = task.startswith(_SKIP_PREFIX)
+    if skip_confirm:
+        rest = task[len(_SKIP_PREFIX):]
+        m    = re.match(r'^([0-9a-f\-]{36})__(.*)', rest, re.DOTALL)
+        task = m.group(2).strip() if m else rest.strip()
+
     # ── 0. Confirm bypass — "confirm <task>" skips MEDIUM block ──────────
-    confirmed = task.lower().startswith("confirm ")
-    actual_task = task[len("confirm "):].strip() if confirmed else task
+    confirmed   = skip_confirm or task.lower().startswith("confirm ")
+    actual_task = task[len("confirm "):].strip() if task.lower().startswith("confirm ") else task
 
     # ── 1. Security: inspect prompt ───────────────────────────────────────
     sec      = security.inspect_prompt(actual_task)
@@ -795,6 +829,26 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
             "artifacts": {},
             "timestamp": ts,
         }
+
+    # ── 2b. Task manager proposal gate ───────────────────────────────────
+    # For actions that require explicit confirmation (calendar, message, follow-up),
+    # present a structured proposal and wait.  Non-blocking intents are still saved.
+    if not skip_confirm:
+        _task_rec = _tm.parse(actual_task)
+        if _task_rec.requires_confirmation:
+            _tm.save(_task_rec)
+            return {
+                "id":        str(uuid.uuid4()),
+                "task":      actual_task,
+                "status":    "pending_confirmation",
+                "answer":    _tm.format_confirmation_request(_task_rec),
+                "security":  {"risk": sec["risk"], "reason": sec["reason"]},
+                "routing":   {"intent": intent},
+                "artifacts": {},
+                "timestamp": ts,
+            }
+        elif _task_rec.intent in _tm.PERSIST_INTENTS:
+            _tm.save(_task_rec)
 
     # ── 3. Detect agents and route ────────────────────────────────────────
     agents = _detect_agents(actual_task, intent)

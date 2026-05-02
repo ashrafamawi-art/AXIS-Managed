@@ -37,7 +37,8 @@ from telegram.ext import (
 # Config
 # ---------------------------------------------------------------------------
 
-AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
+AXIS_API_URL   = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
+AXIS_BASE_URL  = AXIS_API_URL.replace("/task", "")
 AXIS_HEALTH_URL = AXIS_API_URL.replace("/task", "/health")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
@@ -240,11 +241,83 @@ def _transcribe(input_path: str) -> str:
 # Telegram handlers
 # ---------------------------------------------------------------------------
 
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all recent tasks."""
+    if not _authorized(update):
+        return
+    msg = await update.message.reply_text("⏳ Fetching tasks...")
+    try:
+        r = http_lib.get(f"{AXIS_BASE_URL}/tasks?limit=20", timeout=15)
+        r.raise_for_status()
+        data    = r.json()
+        count   = data.get("count", 0)
+        records = data.get("tasks", [])
+        if not records:
+            await msg.edit_text("No tasks found.")
+            return
+        lines = [f"📋 *Tasks* ({count} total)\n"]
+        STATUS_EMOJI = {
+            "pending_confirmation": "⏳", "scheduled": "📅",
+            "completed": "✅", "failed": "❌",
+            "waiting_for_user": "🕐", "cancelled": "🚫",
+        }
+        for r_ in records[:20]:
+            emoji = STATUS_EMOJI.get(r_["status"], "•")
+            due   = f" · {r_['due_at'][:10]}" if r_.get("due_at") else ""
+            lines.append(f"{emoji} `{r_['task_id'][:8]}` {r_['title']}{due}")
+        if count > 20:
+            lines.append(f"_…and {count - 20} more_")
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error fetching tasks: {exc}")
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List tasks pending confirmation."""
+    if not _authorized(update):
+        return
+    msg = await update.message.reply_text("⏳ Checking pending tasks...")
+    try:
+        r = http_lib.get(f"{AXIS_BASE_URL}/tasks/pending", timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("count", 0) == 0:
+            await msg.edit_text("No tasks pending confirmation.")
+            return
+        text = data.get("formatted") or f"⏳ {data['count']} pending task(s)."
+        await msg.edit_text(text, parse_mode="Markdown")
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error: {exc}")
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel a task: /cancel <task_id>"""
+    if not _authorized(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /cancel <task_id>")
+        return
+    task_id = args[0]
+    msg = await update.message.reply_text(f"⏳ Cancelling task `{task_id}`...", parse_mode="Markdown")
+    try:
+        r = http_lib.delete(f"{AXIS_BASE_URL}/tasks/{task_id}", timeout=15)
+        if r.status_code == 404:
+            await msg.edit_text(f"Task `{task_id}` not found.", parse_mode="Markdown")
+        elif r.status_code == 200:
+            await msg.edit_text(f"🚫 Task `{task_id}` cancelled.", parse_mode="Markdown")
+        else:
+            await msg.edit_text(f"⚠️ HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error: {exc}")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     await update.message.reply_text(
-        "AXIS is ready.\n\nSend a text message or a voice note — I'll transcribe and respond."
+        "AXIS is ready.\n\nSend a text message or a voice note — I'll transcribe and respond.\n\n"
+        "Commands: /tasks · /pending · /cancel <id> · /status"
     )
 
 
@@ -376,9 +449,12 @@ def main():
     _check_api_on_startup()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("whoami",  cmd_whoami))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("tasks",   cmd_tasks))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("cancel",  cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
