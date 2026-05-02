@@ -180,11 +180,37 @@ def general_agent(task: str, client: anthropic.Anthropic) -> dict:
     }
 
 
+# Research Agent — web search capability
+def research_agent(task: str, client: anthropic.Anthropic) -> dict:
+    """Search the web and return a summarized answer in Arabic."""
+    try:
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system=(
+                "أنت مساعد بحث. ابحث في الإنترنت عن المعلومات المطلوبة "
+                "وقدم إجابة واضحة ومختصرة باللغة العربية."
+            ),
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": task}],
+            betas=["web-search-2025-03-05"],
+        )
+        answer = " ".join(
+            block.text
+            for block in resp.content
+            if getattr(block, "type", None) == "text"
+        ).strip()
+        return {"answer": answer or "(no results)", "artifacts": {}}
+    except Exception as exc:
+        return {"answer": f"Research failed: {exc}", "artifacts": {}}
+
+
 _AGENT_MAP = {
     "calendar": calendar_agent,
     "task":     task_agent,
     "memory":   memory_agent,
     "general":  general_agent,
+    "research": research_agent,
 }
 
 # Keywords that signal each domain is needed.
@@ -193,6 +219,12 @@ _DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "calendar": ["calendar", "schedule", "meeting", "event", "appointment", "availability"],
     "task":     ["task", "to-do", "todo", "remind", "reminder", "follow-up", "action item"],
     "memory":   ["remember", "recall", "what did i tell", "told you", "from memory"],
+    "research": [
+        # Arabic
+        "ابحث", "بحث", "اخبار", "اخبرني عن", "شو اخر", "ما هو", "معلومات",
+        # English
+        "search", "find", "what is", "latest", "news",
+    ],
 }
 
 
@@ -203,9 +235,9 @@ def _detect_agents(task: str, intent: str) -> list:
     Strategy:
       1. Check the lowercased task text against each domain's keywords.
       2. If two or more domains match → multi-agent: return one function per domain.
-      3. If zero or one domain matches → single-agent: fall back to _AGENT_MAP[intent].
-
-    This keeps single-agent requests on the exact same path as before.
+      3. If exactly one domain matches → use that agent directly (bypasses intent
+         classifier — necessary for "research" which the classifier doesn't know about).
+      4. If no domains match → fall back to _AGENT_MAP[intent] from the classifier.
     """
     lower = task.lower()
 
@@ -224,9 +256,14 @@ def _detect_agents(task: str, intent: str) -> list:
             unique_domains.append(d)
 
     if len(unique_domains) >= 2:
+        # Multi-agent: run every matched domain
         return [_AGENT_MAP[d] for d in unique_domains]
 
-    # Single or no keyword match — use the intent classifier's verdict
+    if len(unique_domains) == 1:
+        # Single keyword match — trust it over the intent classifier
+        return [_AGENT_MAP[unique_domains[0]]]
+
+    # No keyword match — use the intent classifier's verdict
     return [_AGENT_MAP.get(intent, general_agent)]
 
 
