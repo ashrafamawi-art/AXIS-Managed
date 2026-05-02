@@ -27,7 +27,11 @@ _TOKEN_FILE = _DATA_DIR / "token.pickle"
 # ---------------------------------------------------------------------------
 
 _CALENDAR_DEDUP_SECS = 30
-_recent_calendar_events: dict[str, float] = {}  # fingerprint → monotonic time
+_recent_calendar_events: dict[int, float] = {}  # event_hash → monotonic time
+
+
+def _event_hash(title: str, start_iso: str) -> int:
+    return hash(title.strip().lower() + start_iso.strip())
 
 # ---------------------------------------------------------------------------
 # Google Calendar credentials — cloud-first, local fallback
@@ -131,8 +135,8 @@ def _create_calendar_event(
 ) -> str:
     """Create a Google Calendar event. Falls back to save_task if credentials missing."""
     # ── Dedup guard ───────────────────────────────────────────────────────────
-    fingerprint = f"{title.strip().lower()}|{start_iso.strip()}"
-    now_mono    = time.monotonic()
+    event_hash = _event_hash(title, start_iso)
+    now_mono   = time.monotonic()
 
     # Prune expired entries
     expired = [k for k, t in _recent_calendar_events.items()
@@ -140,14 +144,14 @@ def _create_calendar_event(
     for k in expired:
         del _recent_calendar_events[k]
 
-    if fingerprint in _recent_calendar_events:
-        age = round(now_mono - _recent_calendar_events[fingerprint], 1)
+    if event_hash in _recent_calendar_events:
+        age = round(now_mono - _recent_calendar_events[event_hash], 1)
         print(f"[executor] DEDUP: skipping duplicate calendar event "
-              f"'{title}' at {start_iso} (seen {age}s ago)")
+              f"'{title}' at {start_iso} hash={event_hash} (seen {age}s ago)")
         return f"DEDUP: calendar event '{title}' already created ({age}s ago — duplicate skipped)"
 
-    _recent_calendar_events[fingerprint] = now_mono
-    print(f"[executor] calendar event: title={title!r} start={start_iso}")
+    _recent_calendar_events[event_hash] = now_mono
+    print(f"[executor] calendar event: title={title!r} start={start_iso} hash={event_hash}")
 
     try:
         creds = _load_gcal_creds()
@@ -345,7 +349,7 @@ def execute(sub_task: str, context: str, client: anthropic.Anthropic,
     # Local dedup: prevent the inner loop from calling create_calendar_event
     # more than once per execute() invocation (belt-and-suspenders alongside the
     # module-level 30-second window).
-    _local_calendar_keys: set[str] = set()
+    _local_calendar_hashes: set[int] = set()
 
     for round_num in range(10):
         resp = client.messages.create(
@@ -365,20 +369,19 @@ def execute(sub_task: str, context: str, client: anthropic.Anthropic,
 
             # Inner-loop calendar dedup
             if call.name == "create_calendar_event":
-                local_key = (
-                    f"{call.input.get('title','').strip().lower()}"
-                    f"|{call.input.get('start_iso','').strip()}"
+                eh = _event_hash(
+                    call.input.get("title", ""),
+                    call.input.get("start_iso", ""),
                 )
-                if local_key in _local_calendar_keys:
-                    out = (f"DEDUP: create_calendar_event already called "
-                           f"in this execution — skipped")
-                    print(f"{prefix}   DEDUP (inner loop): {local_key}")
+                if eh in _local_calendar_hashes:
+                    out = "DEDUP: create_calendar_event already called in this execution — skipped"
+                    print(f"{prefix}   DEDUP (inner loop): hash={eh}")
                     results.append({"tool": call.name, "output": out})
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": call.id, "content": out,
                     })
                     continue
-                _local_calendar_keys.add(local_key)
+                _local_calendar_hashes.add(eh)
 
             fn  = _DISPATCH.get(call.name)
             out = fn(**call.input) if fn else f"Unknown tool: {call.name}"
