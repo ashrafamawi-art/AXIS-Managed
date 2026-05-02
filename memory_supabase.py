@@ -51,15 +51,22 @@ def _get_client():
     url = os.environ.get("SUPABASE_URL", "").strip()
     key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
     if not url or not key:
-        _init_error = "SUPABASE_URL or SUPABASE_SERVICE_KEY not configured"
+        _init_error = "SUPABASE_URL or SUPABASE_SERVICE_KEY not configured — using JSON fallback"
+        print(f"[memory] {_init_error}")
         return None
 
     try:
         from supabase import create_client
         _client = create_client(url, key)
+        print(f"[memory] Supabase client initialised — backend: supabase (table={_TABLE})")
         return _client
+    except ImportError:
+        _init_error = "supabase package not installed — using JSON fallback"
+        print(f"[memory] ERROR: {_init_error}")
+        return None
     except Exception as exc:
         _init_error = str(exc)
+        print(f"[memory] ERROR initialising Supabase client: {exc} — using JSON fallback")
         return None
 
 
@@ -179,7 +186,8 @@ def load_memory(n: int = 3) -> str:
                 lines.append(f"  → {row['content'][:80]}")
         return "\n".join(lines)
 
-    except Exception:
+    except Exception as exc:
+        print(f"[memory] Supabase select failed: {exc} — falling back to JSON")
         return _legacy_load(n)
 
 
@@ -201,5 +209,6 @@ def save_memory(task: str, content: str, ttl_days: int = 30) -> None:
             "tags":     _extract_tags(task),
             "ttl_days": ttl_days,
         }).execute()
-    except Exception:
+    except Exception as exc:
+        print(f"[memory] Supabase insert failed: {exc} — falling back to JSON")
         _legacy_save(task, content)
