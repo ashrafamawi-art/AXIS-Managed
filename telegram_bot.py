@@ -194,6 +194,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking = await update.message.reply_text("⏳")
     try:
         response = await _ask_axis(text)
+        if len(response) > 4000:
+            response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
         await thinking.edit_text(response)
     except Exception as exc:
         await thinking.edit_text(f"⚠️ Error: {exc}")
@@ -222,6 +224,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status.edit_text(f'🎙 "{text}"\n\n⏳ Asking AXIS...')
         response = await _ask_axis(text)
+        if len(response) > 4000:
+            response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
         await status.edit_text(f'🎙 "{text}"\n\n{response}')
 
     except Exception as exc:
