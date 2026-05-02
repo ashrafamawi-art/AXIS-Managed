@@ -203,20 +203,42 @@ TOOLS = [
     {
         "name": "create_calendar_event",
         "description": (
-            "Create a Google Calendar event. Use whenever the user asks to schedule, "
-            "book, or arrange a meeting, call, or appointment. "
-            "Resolve relative dates (today, tomorrow, next Monday) using today's date from the system prompt."
+            "Create a Google Calendar event for a meeting, call, appointment, or reminder. "
+            "Always extract a descriptive title (include the person's name or topic). "
+            "Always populate description and location."
         ),
         "input_schema": {
             "type": "object", "additionalProperties": False,
             "properties": {
-                "title":       {"type": "string", "description": "Event title"},
-                "start_iso":   {"type": "string", "description": "Start datetime ISO 8601, e.g. '2026-05-03T15:00:00'"},
-                "end_iso":     {"type": "string", "description": "End datetime ISO 8601. Defaults to 1 hour after start."},
-                "description": {"type": "string", "description": "Optional notes or agenda"},
-                "location":    {"type": "string", "description": "Optional location"},
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Descriptive title including the person and/or purpose. "
+                        "Examples: 'Meeting with Bassam', 'Call with Ali — Villa Project', "
+                        "'Follow-up with Client'. Never use bare 'Meeting' or 'Call' alone."
+                    ),
+                },
+                "start_iso": {
+                    "type": "string",
+                    "description": "Start datetime ISO 8601, e.g. '2026-05-03T15:00:00'",
+                },
+                "end_iso": {
+                    "type": "string",
+                    "description": "End datetime ISO 8601. Always set — default to 1 hour after start.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "Always set to: 'Scheduled via AXIS: <exact original user message>'. "
+                        "Example: 'Scheduled via AXIS: Add meeting with Bassam tomorrow at 3pm'"
+                    ),
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Location if mentioned, otherwise 'TBD'.",
+                },
             },
-            "required": ["title", "start_iso"],
+            "required": ["title", "start_iso", "end_iso", "description", "location"],
         },
     },
     {
@@ -327,9 +349,18 @@ def _exec_system() -> str:
         f"You are the AXIS Execution Engine. Today is {now.strftime('%A, %B %-d, %Y')} "
         f"(local time {now.strftime('%-I:%M %p')}).\n"
         "Act on the sub-task autonomously using available tools. "
-        "Be specific — extract names, times, and context from the task.\n"
-        "When creating calendar events, resolve relative dates (today, tomorrow, next Monday) "
-        "using today's date above. Default event duration is 1 hour unless stated otherwise.\n"
+        "Be specific — extract names, times, and context from the task.\n\n"
+        "CALENDAR EVENT QUALITY RULES — follow these exactly:\n"
+        "- title: Extract the person's name and purpose. Examples:\n"
+        "    'Add meeting with Bassam tomorrow at 3pm'  → 'Meeting with Bassam'\n"
+        "    'Schedule call with Ali about the villa'   → 'Call with Ali — Villa'\n"
+        "    'Remind me to follow up with the client'   → 'Follow-up with Client'\n"
+        "  NEVER use bare generic titles: 'Meeting', 'Call', 'Appointment', 'Event'.\n"
+        "  Always include the name or topic that makes the event identifiable.\n"
+        "- end_iso: Default to 1 hour after start if not specified.\n"
+        "- description: Always set to 'Scheduled via AXIS: <exact original user message>'.\n"
+        "- location: Use 'TBD' when no location is mentioned.\n\n"
+        "Resolve relative dates (today, tomorrow, next Monday) using today's date above.\n"
         "If no real-world action is warranted, call no tools."
     )
 
