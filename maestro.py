@@ -567,10 +567,8 @@ _DOMAIN_KEYWORDS: dict[str, list[str]] = {
         "search", "find", "what is", "latest", "news",
     ],
     "github": [
-        # Arabic
-        "كود", "كوود", "طور", "طوّر", "عدل", "راجع", "اقرأ الكود", "حسّن", "ابني", "افتح pr",
-        # English
-        "github", "repo", "branch", "pull request", " pr ",
+        "github", "repo", "branch", "pull request", "pr", "open pr",
+        "merge", "commit", "push", "maestro", "axis-managed",
     ],
 }
 
