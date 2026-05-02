@@ -527,82 +527,36 @@ def _gh_fetch_for_task(task: str) -> dict:
     return {"repo": repo, "context": "\n\n".join(sections), "error": None}
 
 
-# GitHub Developer Agent — reads all repos, writes to ai-dev only, opens PRs
+# GitHub Developer Agent — reads via API only
 def github_agent(task: str, client: anthropic.Anthropic) -> dict:
-    """
-    1. Fetches repo contents eagerly via GitHub REST API (guaranteed — no local filesystem).
-    2. Injects the fetched content into Claude's context for analysis.
-    3. Runs a tool-use loop only if Claude wants to propose and commit changes.
-    """
-    # ── Step 1: fetch from GitHub API now, before Claude runs ────────────
-    fetched = _gh_fetch_for_task(task)
-    if fetched["error"]:
-        return {"answer": f"GitHub API error: {fetched['error']}", "artifacts": {}}
+    token = os.environ.get("GITHUB_TOKEN", "")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/vnd.github+json",
+    }
 
-    repo    = fetched["repo"]
-    context = fetched["context"]
-    _gh_log("github_agent_start", f"repo={repo}, task={task[:80]}")
+    # Always read maestro.py from AXIS-Managed via GitHub REST API
+    url = "https://api.github.com/repos/ashrafamawi-art/AXIS-Managed/contents/maestro.py"
+    r = requests.get(url, headers=headers, timeout=15)
 
-    # ── Step 2: build the prompt with the real file content ───────────────
-    system = (
-        f"You are AXIS GitHub Developer Agent for '{_GH_OWNER}'.\n\n"
-        "The file contents below were fetched live from GitHub REST API — NOT from local disk.\n"
-        "Analyse them and respond to the user's request.\n\n"
-        "Hard rules:\n"
-        f"1. All writes go ONLY to '{_GH_BRANCH}' branch — NEVER to main.\n"
-        "2. After writing files, ALWAYS open a Pull Request with create_pull_request.\n"
-        "3. NEVER include secrets, API keys, or tokens in any file.\n"
-        "4. NEVER delete repos or branches.\n"
-        "5. NEVER auto-merge PRs — Ashraf must review manually.\n\n"
-        "Respond in Arabic. Be specific about what you found and what you recommend."
+    if r.status_code != 200:
+        return {"answer": f"GitHub API error: {r.status_code} - {r.text}", "artifacts": {}}
+
+    content = base64.b64decode(r.json()["content"]).decode("utf-8")
+    _gh_log("read_file", f"AXIS-Managed/maestro.py ({len(content)} chars)")
+
+    # Ask Claude to analyze the fetched content
+    resp = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        messages=[{
+            "role":    "user",
+            "content": f"راجع هذا الكود واقترح تحسينات بالعربي:\n\n{content[:8000]}",
+        }],
     )
 
-    user_message = f"{task}\n\n{context}"
-    messages: list[dict] = [{"role": "user", "content": user_message}]
-    artifacts: dict      = {}
-
-    # ── Step 3: tool-use loop (Claude may write files and open a PR) ──────
-    for _ in range(15):
-        resp = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=4096,
-            system=system,
-            tools=_GH_TOOLS,
-            messages=messages,
-        )
-
-        if resp.stop_reason == "end_turn":
-            answer = " ".join(
-                block.text for block in resp.content
-                if getattr(block, "type", None) == "text"
-            ).strip()
-            return {"answer": answer or "(no response)", "artifacts": artifacts}
-
-        if resp.stop_reason != "tool_use":
-            break
-
-        messages.append({"role": "assistant", "content": resp.content})
-
-        tool_results = []
-        for block in resp.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            result_str = _gh_dispatch(block.name, block.input)
-            tool_results.append({
-                "type":        "tool_result",
-                "tool_use_id": block.id,
-                "content":     result_str,
-            })
-            try:
-                parsed = json.loads(result_str)
-                if "pr_url" in parsed:
-                    artifacts.setdefault("pull_requests", []).append(parsed["pr_url"])
-            except Exception:
-                pass
-
-        messages.append({"role": "user", "content": tool_results})
-
-    return {"answer": "GitHub agent finished.", "artifacts": artifacts}
+    answer = resp.content[0].text if resp.content else "لا يوجد جواب"
+    return {"answer": answer, "artifacts": {}}
 
 
 _AGENT_MAP = {
