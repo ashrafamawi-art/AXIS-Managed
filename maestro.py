@@ -14,8 +14,10 @@ Single-agent requests behave exactly as before.
 Multi-agent requests run all needed agents and merge their outputs.
 """
 
+import base64
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -205,12 +207,313 @@ def research_agent(task: str, client: anthropic.Anthropic) -> dict:
         return {"answer": f"Research failed: {exc}", "artifacts": {}}
 
 
+# ---------------------------------------------------------------------------
+# GitHub Developer Agent infrastructure
+# ---------------------------------------------------------------------------
+
+_GH_BASE   = "https://api.github.com"
+_GH_OWNER  = "ashrafamawi-art"
+_GH_BRANCH = "ai-dev"                    # all writes go here — never main
+_GH_LOG    = _DATA_DIR / "github_agent.log"
+
+# Reject file content that looks like a hardcoded secret before any commit.
+_SECRET_RE = re.compile(
+    r"(?:api[_\-]?key|secret(?:[_\-]key)?|password|auth[_\-]?token|private[_\-]?key"
+    r"|ANTHROPIC_API_KEY|TELEGRAM_TOKEN|GITHUB_TOKEN|access_token)"
+    r"\s*[=:]\s*['\"][A-Za-z0-9+/=_\-\.]{10,}['\"]",
+    re.IGNORECASE,
+)
+
+# Tool schemas exposed to Claude inside github_agent.
+_GH_TOOLS = [
+    {
+        "name": "list_repos",
+        "description": "List all repositories under the ashrafamawi-art GitHub account.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_files",
+        "description": "List files and subdirectories at a path inside a repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo":   {"type": "string", "description": "Repository name"},
+                "path":   {"type": "string", "description": "Directory path (empty string for root)"},
+                "branch": {"type": "string", "description": "Branch to read from (default: main)"},
+            },
+            "required": ["repo"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read the full content of a file from any branch of any repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo":   {"type": "string", "description": "Repository name"},
+                "path":   {"type": "string", "description": "File path inside the repo"},
+                "branch": {"type": "string", "description": "Branch to read from (default: main)"},
+            },
+            "required": ["repo", "path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": (
+            "Create or update a file on the ai-dev branch. "
+            "ONLY write to ai-dev — never to main or any other branch."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo":    {"type": "string", "description": "Repository name"},
+                "path":    {"type": "string", "description": "File path inside the repo"},
+                "content": {"type": "string", "description": "Full new file content"},
+                "message": {"type": "string", "description": "Commit message describing the change"},
+            },
+            "required": ["repo", "path", "content", "message"],
+        },
+    },
+    {
+        "name": "create_pull_request",
+        "description": (
+            "Open a pull request from ai-dev → main for Ashraf to review. "
+            "Always call this after writing files — never auto-merge."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo":  {"type": "string", "description": "Repository name"},
+                "title": {"type": "string", "description": "Short PR title"},
+                "body":  {"type": "string", "description": "PR description: what changed and why"},
+            },
+            "required": ["repo", "title", "body"],
+        },
+    },
+]
+
+
+def _gh_headers() -> dict:
+    token = os.environ.get("GITHUB_TOKEN", "")
+    return {
+        "Authorization":        f"Bearer {token}",
+        "Accept":               "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _gh_log(action: str, detail: str) -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        entry = {"ts": datetime.now(timezone.utc).isoformat(), "action": action, "detail": detail}
+        with _GH_LOG.open("a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _gh_ensure_ai_dev(repo: str) -> None:
+    """Create the ai-dev branch from main if it does not already exist."""
+    headers = _gh_headers()
+    url     = f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/git/refs/heads/{_GH_BRANCH}"
+
+    if requests.get(url, headers=headers, timeout=10).status_code == 200:
+        return  # already exists
+
+    # Resolve main HEAD
+    r = requests.get(
+        f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/git/refs/heads/main",
+        headers=headers, timeout=10,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Cannot read main branch in {repo}: {r.text}")
+    main_sha = r.json()["object"]["sha"]
+
+    r = requests.post(
+        f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/git/refs",
+        headers=headers,
+        json={"ref": f"refs/heads/{_GH_BRANCH}", "sha": main_sha},
+        timeout=10,
+    )
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Cannot create {_GH_BRANCH} in {repo}: {r.text}")
+    _gh_log("create_branch", f"{repo}/{_GH_BRANCH} from main@{main_sha[:7]}")
+
+
+def _gh_dispatch(name: str, inp: dict) -> str:
+    """Execute one GitHub tool call; return a JSON string result."""
+    headers = _gh_headers()
+
+    if name == "list_repos":
+        r = requests.get(
+            f"{_GH_BASE}/users/{_GH_OWNER}/repos?per_page=50&type=all",
+            headers=headers, timeout=10,
+        )
+        repos = [x["name"] for x in r.json()] if r.status_code == 200 else []
+        _gh_log("list_repos", str(repos))
+        return json.dumps({"repos": repos})
+
+    if name == "list_files":
+        repo   = inp["repo"]
+        path   = inp.get("path", "")
+        branch = inp.get("branch", "main")
+        r = requests.get(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/{path}?ref={branch}",
+            headers=headers, timeout=10,
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": r.text})
+        items = [{"name": x["name"], "type": x["type"], "path": x["path"]} for x in r.json()]
+        _gh_log("list_files", f"{repo}/{path}@{branch} → {len(items)} items")
+        return json.dumps({"files": items})
+
+    if name == "read_file":
+        repo   = inp["repo"]
+        path   = inp["path"]
+        branch = inp.get("branch", "main")
+        r = requests.get(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/{path}?ref={branch}",
+            headers=headers, timeout=10,
+        )
+        if r.status_code != 200:
+            return json.dumps({"error": r.text})
+        data    = r.json()
+        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        _gh_log("read_file", f"{repo}/{path}@{branch} ({len(content)} chars)")
+        return json.dumps({"content": content, "sha": data["sha"]})
+
+    if name == "write_file":
+        repo    = inp["repo"]
+        path    = inp["path"]
+        content = inp["content"]
+        message = inp.get("message", "chore: AXIS ai-dev update")
+
+        # Safety: reject content that looks like it contains hardcoded secrets
+        if _SECRET_RE.search(content):
+            _gh_log("write_file_BLOCKED", f"{repo}/{path} — secret pattern detected")
+            return json.dumps({"error": "Write blocked: content appears to contain hardcoded secrets."})
+
+        try:
+            _gh_ensure_ai_dev(repo)
+        except RuntimeError as exc:
+            return json.dumps({"error": str(exc)})
+
+        # Fetch existing file SHA (required by GitHub API to update)
+        r       = requests.get(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/{path}?ref={_GH_BRANCH}",
+            headers=headers, timeout=10,
+        )
+        payload: dict = {
+            "message": message,
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch":  _GH_BRANCH,
+        }
+        if r.status_code == 200:
+            payload["sha"] = r.json()["sha"]
+
+        r = requests.put(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/{path}",
+            headers=headers, json=payload, timeout=15,
+        )
+        if r.status_code not in (200, 201):
+            return json.dumps({"error": r.text})
+        _gh_log("write_file", f"{repo}/{path}@{_GH_BRANCH} — {message}")
+        return json.dumps({"status": "ok", "branch": _GH_BRANCH, "path": path})
+
+    if name == "create_pull_request":
+        repo  = inp["repo"]
+        title = inp.get("title", "AXIS: Proposed changes")
+        body  = inp.get("body", "Automated PR from AXIS GitHub Agent — please review before merging.")
+        r = requests.post(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/pulls",
+            headers=headers,
+            json={"title": title, "body": body, "head": _GH_BRANCH, "base": "main"},
+            timeout=15,
+        )
+        if r.status_code not in (200, 201):
+            return json.dumps({"error": r.text})
+        pr_url = r.json().get("html_url", "")
+        _gh_log("create_pull_request", f"{repo} → {pr_url}")
+        return json.dumps({"status": "ok", "pr_url": pr_url})
+
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+# GitHub Developer Agent — reads all repos, writes to ai-dev only, opens PRs
+def github_agent(task: str, client: anthropic.Anthropic) -> dict:
+    """
+    Agentic GitHub developer: reads any repo, proposes and implements changes
+    on the ai-dev branch, then opens a PR. Never touches main directly.
+    Runs a tool-use loop (max 20 rounds) until Claude calls end_turn.
+    """
+    system = (
+        f"You are AXIS GitHub Developer Agent for the account '{_GH_OWNER}'.\n\n"
+        "Hard rules — never break these:\n"
+        f"1. All writes go ONLY to the '{_GH_BRANCH}' branch — NEVER to main.\n"
+        "2. After writing files, ALWAYS open a Pull Request with create_pull_request.\n"
+        "3. NEVER include secrets, API keys, tokens, or passwords in any file.\n"
+        "4. NEVER delete repositories or branches.\n"
+        "5. NEVER auto-merge PRs — Ashraf must review and merge manually.\n\n"
+        "Workflow: list_repos → list_files → read_file → analyse → write_file → create_pull_request.\n"
+        "Respond to the user in Arabic. Explain clearly what you read, what you changed, and why."
+    )
+
+    messages: list[dict]  = [{"role": "user", "content": task}]
+    artifacts: dict       = {}
+
+    for _ in range(20):   # cap at 20 tool rounds to avoid runaway loops
+        resp = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            system=system,
+            tools=_GH_TOOLS,
+            messages=messages,
+        )
+
+        if resp.stop_reason == "end_turn":
+            answer = " ".join(
+                block.text for block in resp.content
+                if getattr(block, "type", None) == "text"
+            ).strip()
+            return {"answer": answer or "(no response)", "artifacts": artifacts}
+
+        if resp.stop_reason != "tool_use":
+            break
+
+        # Append assistant turn
+        messages.append({"role": "assistant", "content": resp.content})
+
+        # Execute every tool call in this round
+        tool_results = []
+        for block in resp.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            result_str = _gh_dispatch(block.name, block.input)
+            tool_results.append({
+                "type":        "tool_result",
+                "tool_use_id": block.id,
+                "content":     result_str,
+            })
+            # Surface PR URLs in artifacts
+            try:
+                parsed = json.loads(result_str)
+                if "pr_url" in parsed:
+                    artifacts.setdefault("pull_requests", []).append(parsed["pr_url"])
+            except Exception:
+                pass
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return {"answer": "GitHub agent finished (tool round limit reached).", "artifacts": artifacts}
+
+
 _AGENT_MAP = {
     "calendar": calendar_agent,
     "task":     task_agent,
     "memory":   memory_agent,
     "general":  general_agent,
     "research": research_agent,
+    "github":   github_agent,
 }
 
 # Keywords that signal each domain is needed.
@@ -224,6 +527,12 @@ _DOMAIN_KEYWORDS: dict[str, list[str]] = {
         "ابحث", "بحث", "اخبار", "اخبرني عن", "شو اخر", "ما هو", "معلومات",
         # English
         "search", "find", "what is", "latest", "news",
+    ],
+    "github": [
+        # Arabic
+        "كود", "كوود", "طور", "طوّر", "عدل", "راجع", "اقرأ الكود", "حسّن", "ابني", "افتح pr",
+        # English
+        "github", "repo", "branch", "pull request", " pr ",
     ],
 }
 
