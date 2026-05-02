@@ -18,7 +18,9 @@ import base64
 import json
 import os
 import re
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -795,17 +797,30 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
 
     # ── 3. Detect agents and route ────────────────────────────────────────
     agents = _detect_agents(actual_task, intent)
+    t0 = time.monotonic()
 
     if len(agents) == 1:
-        # Single-agent path — identical to original behavior
-        agent_fn     = agents[0]
-        agent_result = agent_fn(actual_task, client)
-        agent_names  = [agent_fn.__name__]
+        agent_fn = agents[0]
+        try:
+            agent_result = agent_fn(actual_task, client)
+        except Exception as exc:
+            agent_result = {"answer": f"⚠️ Agent error: {exc}", "artifacts": {}}
+        agent_names = [agent_fn.__name__]
     else:
-        # Multi-agent path — run all detected agents, then merge
-        named = [(fn.__name__, fn(actual_task, client)) for fn in agents]
+        # Run all agents in parallel; isolate failures per agent
+        named: list[tuple[str, dict]] = []
+        with ThreadPoolExecutor(max_workers=len(agents)) as pool:
+            futures = {pool.submit(fn, actual_task, client): fn.__name__ for fn in agents}
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    named.append((name, fut.result()))
+                except Exception as exc:
+                    named.append((name, {"answer": f"⚠️ Agent error: {exc}", "artifacts": {}}))
         agent_result = _merge_results(named)
         agent_names  = [name for name, _ in named]
+
+    execution_ms = round((time.monotonic() - t0) * 1000)
 
     # ── 4. Persist to memory ──────────────────────────────────────────────
     _save_memory(actual_task, agent_result.get("answer", ""))
@@ -819,8 +834,9 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
         "answer":    agent_result.get("answer", "(no response)"),
         "security":  {"risk": sec["risk"], "reason": sec["reason"]},
         "routing":   {"intent": intent, "agents": agent_names},
-        "artifacts": agent_result.get("artifacts", {}),
-        "timestamp": ts,
+        "artifacts":    agent_result.get("artifacts", {}),
+        "execution_ms": execution_ms,
+        "timestamp":    ts,
     }
 
     for key in ("council", "plan"):

@@ -182,7 +182,7 @@ def execute(sub_task: str, context: str, client: anthropic.Anthropic) -> list[di
     }]
     results: list[dict] = []
 
-    while True:
+    for _ in range(10):
         resp = client.messages.create(
             model=_MODEL,
             max_tokens=1024,
