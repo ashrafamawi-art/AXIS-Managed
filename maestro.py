@@ -529,18 +529,67 @@ def _gh_fetch_for_task(task: str) -> dict:
 
 # GitHub Developer Agent — reads via API only
 def github_agent(task: str, client: anthropic.Anthropic) -> dict:
-    import requests, base64, os
-    token = os.environ.get("GITHUB_TOKEN", "")
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    url = "https://api.github.com/repos/ashrafamawi-art/AXIS-Managed/contents/maestro.py"
-    r = requests.get(url, headers=headers)
+    lower = task.lower()
+
+    # Detect repo name from task; default to AXIS-Managed
+    repo = "AXIS-Managed"
+    for candidate in ["axis-managed", "axis managed"]:
+        if candidate in lower:
+            repo = "AXIS-Managed"
+            break
+
+    # ── Direct actions: call _gh_dispatch immediately, no Claude involved ─
+
+    # open PR / create PR
+    if any(kw in lower for kw in ["open pr", "create pr", "افتح pr", "open pull request", "create pull request"]):
+        result = json.loads(_gh_dispatch("create_pull_request", {
+            "repo":  repo,
+            "title": f"AXIS: {task[:60]}",
+            "body":  f"PR opened by AXIS GitHub Agent.\n\nOriginal request: {task}",
+        }))
+        if "pr_url" in result:
+            return {"answer": f"✅ تم فتح الـ PR:\n{result['pr_url']}", "artifacts": {"pull_requests": [result["pr_url"]]}}
+        return {"answer": f"❌ فشل فتح الـ PR: {result.get('error', str(result))}", "artifacts": {}}
+
+    # list repos
+    if any(kw in lower for kw in ["list repos", "show repos", "اعرض الريبو", "list repositories"]):
+        result = json.loads(_gh_dispatch("list_repos", {}))
+        repos  = result.get("repos", [])
+        return {"answer": "📁 الريبوزيتوريز:\n" + "\n".join(f"• {r}" for r in repos), "artifacts": {}}
+
+    # list files
+    if any(kw in lower for kw in ["list files", "show files", "اعرض الملفات", "اعرض الكود"]):
+        result = json.loads(_gh_dispatch("list_files", {"repo": repo}))
+        if "error" in result:
+            return {"answer": f"❌ {result['error']}", "artifacts": {}}
+        files = result.get("files", [])
+        return {"answer": f"📂 ملفات {repo}:\n" + "\n".join(f"• {f['name']}" for f in files), "artifacts": {}}
+
+    # ── Analysis / review: fetch file via GitHub API, pass actual task to Claude ─
+
+    # Detect which file to read from task text; default maestro.py
+    file_match = re.search(r'(\w[\w\-]*\.py)', task)
+    filename   = file_match.group(1) if file_match else "maestro.py"
+
+    token   = os.environ.get("GITHUB_TOKEN", "")
+    gh_hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    r       = requests.get(
+        f"https://api.github.com/repos/{_GH_OWNER}/{repo}/contents/{filename}",
+        headers=gh_hdrs,
+    )
     if r.status_code != 200:
-        return {"answer": f"GitHub API error: {r.status_code}", "artifacts": {}}
+        return {"answer": f"❌ GitHub API error {r.status_code}: لم يتم العثور على {filename} في {repo}", "artifacts": {}}
+
     content = base64.b64decode(r.json()["content"]).decode("utf-8")
+    _gh_log("read_file", f"{repo}/{filename} ({len(content)} chars)")
+
     resp = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=2000,
-        messages=[{"role": "user", "content": f"راجع هذا الكود واقترح تحسينات بالعربي:\n\n{content[:8000]}"}]
+        messages=[{
+            "role":    "user",
+            "content": f"{task}\n\n--- {filename} من {repo} (GitHub API) ---\n{content[:8000]}",
+        }],
     )
     return {"answer": resp.content[0].text, "artifacts": {}}
 
