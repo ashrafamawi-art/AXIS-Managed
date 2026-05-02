@@ -203,6 +203,8 @@ def research_agent(task: str, client: anthropic.Anthropic) -> dict:
             for block in resp.content
             if getattr(block, "type", None) == "text"
         ).strip()
+        if answer:
+            _save_memory(task, answer)
         return {"answer": answer or "(no results)", "artifacts": {}}
     except Exception as exc:
         return {"answer": f"Research failed: {exc}", "artifacts": {}}
