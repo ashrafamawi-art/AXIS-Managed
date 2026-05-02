@@ -30,6 +30,7 @@ import requests
 import security
 import council
 import executor
+import memory_supabase as _mem
 import task_manager as _tm
 
 _SKIP_PREFIX = "__SKIP_CONFIRM__"
@@ -38,8 +39,7 @@ _SKIP_PREFIX = "__SKIP_CONFIRM__"
 # Config
 # ---------------------------------------------------------------------------
 
-_DATA_DIR    = Path(os.environ.get("AXIS_DATA_DIR", str(Path(__file__).parent)))
-_MEMORY_FILE = _DATA_DIR / "memory.json"
+_DATA_DIR = Path(os.environ.get("AXIS_DATA_DIR", str(Path(__file__).parent)))
 
 _INTENT_SCHEMA = {
     "type": "object",
@@ -108,34 +108,11 @@ def _send_security_alert(task: str, reason: str, category: str) -> None:
 
 
 def _load_memory(n: int = 3) -> str:
-    if not _MEMORY_FILE.exists():
-        return ""
-    try:
-        entries = json.loads(_MEMORY_FILE.read_text()).get("entries", [])[-n:]
-        lines   = ["[Recent memory]"]
-        for e in entries:
-            lines.append(f"• [{e['ts'][:10]}] {e.get('task','')!r}")
-            if e.get("outcome"):
-                lines.append(f"  → {e['outcome'][:80]}")
-        return "\n".join(lines)
-    except Exception:
-        return ""
+    return _mem.load_memory(n)
 
 
 def _save_memory(task: str, outcome: str) -> None:
-    try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        entries = []
-        if _MEMORY_FILE.exists():
-            entries = json.loads(_MEMORY_FILE.read_text()).get("entries", [])
-        entries.append({
-            "ts":      datetime.now(timezone.utc).isoformat(),
-            "task":    task,
-            "outcome": outcome[:200],
-        })
-        _MEMORY_FILE.write_text(json.dumps({"entries": entries}, indent=2))
-    except Exception:
-        pass
+    _mem.save_memory(task, outcome)
 
 # ---------------------------------------------------------------------------
 # Agents
