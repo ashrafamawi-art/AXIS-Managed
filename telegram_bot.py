@@ -45,7 +45,7 @@ def _require(env: str, fallback_file: Path = None) -> str:
                        (f" and {fallback_file} not found" if fallback_file else "") + ".")
 
 
-AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
+AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-managed.onrender.com/task")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
 api_key        = os.environ.get("ANTHROPIC_API_KEY", "")
