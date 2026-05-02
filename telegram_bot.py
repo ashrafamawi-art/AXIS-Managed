@@ -61,18 +61,26 @@ def _ts() -> str:
 # AXIS API call — no fallback, no local Claude response for text
 # ---------------------------------------------------------------------------
 
-def _call_axis_api(text: str) -> dict:
+def _call_axis_api(text: str, request_id: str = "") -> dict:
     """
     Blocking: POST task to AXIS REST API.
+    request_id is derived from Telegram's update_id — stable across retries,
+    so the server-side dedup cache can detect and skip duplicate deliveries.
     Returns the full response dict so callers can surface execution artifacts.
-    Raises on HTTP error — caller shows the error to the user directly.
+    Raises on HTTP error — caller shows the error directly.
     """
+    payload: dict = {"task": text}
+    if request_id:
+        payload["request_id"] = request_id
+
     print(f"[{_ts()}] [AXIS Telegram] → POST {AXIS_API_URL}")
-    print(f"[{_ts()}] [AXIS Telegram]   task: {text[:120]!r}")
+    print(f"[{_ts()}] [AXIS Telegram]   request_id={request_id or '(none)'}  "
+          f"task={text[:100]!r}")
 
-    resp = http_lib.post(AXIS_API_URL, json={"task": text}, timeout=120)
+    resp = http_lib.post(AXIS_API_URL, json=payload, timeout=120)
 
-    print(f"[{_ts()}] [AXIS Telegram] ← HTTP {resp.status_code} ({resp.elapsed.total_seconds():.1f}s)")
+    print(f"[{_ts()}] [AXIS Telegram] ← HTTP {resp.status_code} "
+          f"({resp.elapsed.total_seconds():.1f}s)")
     resp.raise_for_status()
 
     data = resp.json()
@@ -131,10 +139,10 @@ def _format_response(data: dict) -> str:
     return answer + suffix
 
 
-async def _ask_axis(text: str) -> str:
+async def _ask_axis(text: str, request_id: str = "") -> str:
     """Async wrapper: runs the blocking API call in a thread pool."""
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _call_axis_api, text)
+    data = await loop.run_in_executor(None, _call_axis_api, text, request_id)
     return _format_response(data)
 
 
@@ -278,12 +286,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    uid = update.effective_user.id
-    print(f"[{_ts()}] [AXIS Telegram] text from uid={uid}: {text[:80]!r}")
+    uid        = update.effective_user.id
+    # update_id is unique per Telegram message and stable across retries
+    request_id = f"tg-{update.update_id}"
+    print(f"[{_ts()}] [AXIS Telegram] text uid={uid} update_id={update.update_id}: {text[:80]!r}")
 
     thinking = await update.message.reply_text("⏳")
     try:
-        response = await _ask_axis(text)
+        response = await _ask_axis(text, request_id=request_id)
         if len(response) > 4000:
             response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
         await thinking.edit_text(response)
@@ -300,9 +310,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
 
-    uid    = update.effective_user.id
-    status = await update.message.reply_text("🎙 Transcribing...")
-    ogg_path = None
+    uid        = update.effective_user.id
+    request_id = f"tg-{update.update_id}"
+    status     = await update.message.reply_text("🎙 Transcribing...")
+    ogg_path   = None
     try:
         voice   = update.message.voice
         tg_file = await context.bot.get_file(voice.file_id)
@@ -318,10 +329,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("⚠️ Could not transcribe audio. Please try again.")
             return
 
-        print(f"[{_ts()}] [AXIS Telegram] voice from uid={uid} → transcribed: {text[:80]!r}")
+        print(f"[{_ts()}] [AXIS Telegram] voice uid={uid} update_id={update.update_id} "
+              f"→ transcribed: {text[:80]!r}")
         await status.edit_text(f'🎙 "{text}"\n\n⏳ Asking AXIS...')
 
-        response = await _ask_axis(text)
+        response = await _ask_axis(text, request_id=request_id)
         if len(response) > 4000:
             response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
         await status.edit_text(f'🎙 "{text}"\n\n{response}')

@@ -17,8 +17,10 @@ Environment variables:
 """
 
 import asyncio
+import hashlib
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,36 @@ from pydantic import BaseModel
 import council
 import executor
 import maestro
+
+# ---------------------------------------------------------------------------
+# Request-level dedup cache
+# Prevents duplicate execution when Telegram retries a slow request or the
+# same task is submitted twice within the same minute.
+# ---------------------------------------------------------------------------
+
+_REQUEST_CACHE: dict[str, tuple[dict, float]] = {}  # fingerprint → (result, epoch_s)
+_REQUEST_CACHE_TTL = 60  # seconds
+
+
+def _request_fingerprint(task: str) -> str:
+    """SHA-256 of task text + current minute bucket."""
+    minute = int(time.time() // 60)
+    return hashlib.sha256(f"{task.strip()}|{minute}".encode()).hexdigest()[:16]
+
+
+def _cache_get(fp: str) -> dict | None:
+    now = time.time()
+    # Prune expired entries
+    for k in [k for k, (_, t) in _REQUEST_CACHE.items() if now - t > _REQUEST_CACHE_TTL]:
+        del _REQUEST_CACHE[k]
+    if fp in _REQUEST_CACHE:
+        result, _ = _REQUEST_CACHE[fp]
+        return result
+    return None
+
+
+def _cache_set(fp: str, result: dict) -> None:
+    _REQUEST_CACHE[fp] = (result, time.time())
 
 # ---------------------------------------------------------------------------
 # Config
@@ -136,8 +168,11 @@ def _stream_axis(session_id: str, message: str) -> str:
 # Task pipeline (blocking — runs in thread pool from async endpoint)
 # ---------------------------------------------------------------------------
 
-def _run_pipeline(task: str) -> dict:
-    ts = datetime.now(timezone.utc).isoformat()
+def _run_pipeline(task: str, request_id: str = "") -> dict:
+    ts     = datetime.now(timezone.utc).isoformat()
+    rid    = request_id or str(uuid.uuid4())[:8]
+    prefix = f"[pipeline/{rid}]"
+    print(f"{prefix} start: {task[:100]!r}")
 
     # 1. Load AXIS agent + session
     agent_id   = _load_agent_id()
@@ -153,11 +188,13 @@ def _run_pipeline(task: str) -> dict:
 
     # 4. Plan — decompose into sub-tasks
     sub_tasks, reasoning = executor.plan(task, axis_response, "", client)
+    print(f"{prefix} plan: {len(sub_tasks)} sub-tasks: {sub_tasks}")
 
-    # 5. Execute each sub-task
+    # 5. Execute each sub-task — pass request_id so executor can log it
     all_results: list[dict] = []
-    for sub_task in sub_tasks:
-        results = executor.execute(sub_task, task, client)
+    for i, sub_task in enumerate(sub_tasks, 1):
+        print(f"{prefix} executing sub-task {i}/{len(sub_tasks)}")
+        results = executor.execute(sub_task, task, client, request_id=rid)
         all_results.extend(results)
 
     # 6. Feedback pass — close the loop with AXIS
@@ -211,6 +248,7 @@ def _run_pipeline(task: str) -> dict:
 
 class TaskRequest(BaseModel):
     task: str
+    request_id: str = ""  # optional; generated if absent
 
 
 @app.get("/health")
@@ -220,11 +258,24 @@ def health():
 
 @app.post("/task")
 async def post_task(req: TaskRequest):
-    if not req.task.strip():
+    task = req.task.strip()
+    if not task:
         raise HTTPException(status_code=400, detail="task must not be empty")
+
+    # ── Request-level dedup ────────────────────────────────────────────────
+    fp = req.request_id.strip() if req.request_id.strip() else _request_fingerprint(task)
+    cached = _cache_get(fp)
+    if cached:
+        print(f"[server] returning cached result for fp={fp} task={task[:60]!r}")
+        return cached
+
     try:
         loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, maestro.run, req.task.strip(), client)
+        result = await loop.run_in_executor(
+            None, maestro.run, task, client
+        )
+        result["request_id"] = fp
+        _cache_set(fp, result)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

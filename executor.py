@@ -8,6 +8,7 @@ execute() — runs one sub-task through the Claude tool-use loop
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,6 +19,15 @@ _MODEL      = "claude-sonnet-4-6"
 _DATA_DIR   = Path(os.environ.get("AXIS_DATA_DIR", str(Path(__file__).parent)))
 _TASKS_FILE = _DATA_DIR / "tasks.md"
 _TOKEN_FILE = _DATA_DIR / "token.pickle"
+
+# ---------------------------------------------------------------------------
+# Calendar dedup — prevents the same event being created more than once
+# within a 30-second window (covers multiple sub-tasks in the same pipeline run
+# and Telegram retries that arrive before the first response is acknowledged).
+# ---------------------------------------------------------------------------
+
+_CALENDAR_DEDUP_SECS = 30
+_recent_calendar_events: dict[str, float] = {}  # fingerprint → monotonic time
 
 # ---------------------------------------------------------------------------
 # Google Calendar credentials — cloud-first, local fallback
@@ -120,6 +130,25 @@ def _create_calendar_event(
     **_,
 ) -> str:
     """Create a Google Calendar event. Falls back to save_task if credentials missing."""
+    # ── Dedup guard ───────────────────────────────────────────────────────────
+    fingerprint = f"{title.strip().lower()}|{start_iso.strip()}"
+    now_mono    = time.monotonic()
+
+    # Prune expired entries
+    expired = [k for k, t in _recent_calendar_events.items()
+               if now_mono - t > _CALENDAR_DEDUP_SECS]
+    for k in expired:
+        del _recent_calendar_events[k]
+
+    if fingerprint in _recent_calendar_events:
+        age = round(now_mono - _recent_calendar_events[fingerprint], 1)
+        print(f"[executor] DEDUP: skipping duplicate calendar event "
+              f"'{title}' at {start_iso} (seen {age}s ago)")
+        return f"DEDUP: calendar event '{title}' already created ({age}s ago — duplicate skipped)"
+
+    _recent_calendar_events[fingerprint] = now_mono
+    print(f"[executor] calendar event: title={title!r} start={start_iso}")
+
     try:
         creds = _load_gcal_creds()
         if creds is None:
@@ -254,6 +283,11 @@ _PLAN_SCHEMA = {
 _PLAN_SYSTEM = """\
 You are the AXIS Planning Engine. Decompose the task into 2-5 concrete, executable sub-tasks.
 Each sub-task must be specific enough to act on immediately (save a task, call an API, etc.).
+
+CRITICAL: Calendar event creation must appear as AT MOST ONE sub-task. Never generate two or
+more sub-tasks that both result in creating a calendar event for the same meeting. If the task
+involves scheduling a meeting, create exactly ONE sub-task for the calendar event creation.
+
 Output valid JSON only.
 """
 
@@ -296,15 +330,24 @@ def _exec_system() -> str:
     )
 
 
-def execute(sub_task: str, context: str, client: anthropic.Anthropic) -> list[dict]:
+def execute(sub_task: str, context: str, client: anthropic.Anthropic,
+            request_id: str = "") -> list[dict]:
     """Run one sub-task through the tool loop. Returns list of {tool, output} dicts."""
+    prefix = f"[executor{f'/{request_id[:8]}' if request_id else ''}]"
+    print(f"{prefix} sub-task: {sub_task[:100]!r}")
+
     messages = [{
         "role": "user",
         "content": f"Sub-task: {sub_task}\nContext: {context}" if context else f"Sub-task: {sub_task}",
     }]
     results: list[dict] = []
 
-    for _ in range(10):
+    # Local dedup: prevent the inner loop from calling create_calendar_event
+    # more than once per execute() invocation (belt-and-suspenders alongside the
+    # module-level 30-second window).
+    _local_calendar_keys: set[str] = set()
+
+    for round_num in range(10):
         resp = client.messages.create(
             model=_MODEL,
             max_tokens=1024,
@@ -318,8 +361,28 @@ def execute(sub_task: str, context: str, client: anthropic.Anthropic) -> list[di
 
         tool_results = []
         for call in calls:
+            print(f"{prefix}   round {round_num + 1}: {call.name}({list(call.input.keys())})")
+
+            # Inner-loop calendar dedup
+            if call.name == "create_calendar_event":
+                local_key = (
+                    f"{call.input.get('title','').strip().lower()}"
+                    f"|{call.input.get('start_iso','').strip()}"
+                )
+                if local_key in _local_calendar_keys:
+                    out = (f"DEDUP: create_calendar_event already called "
+                           f"in this execution — skipped")
+                    print(f"{prefix}   DEDUP (inner loop): {local_key}")
+                    results.append({"tool": call.name, "output": out})
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": call.id, "content": out,
+                    })
+                    continue
+                _local_calendar_keys.add(local_key)
+
             fn  = _DISPATCH.get(call.name)
             out = fn(**call.input) if fn else f"Unknown tool: {call.name}"
+            print(f"{prefix}   → {out[:120]}")
             results.append({"tool": call.name, "output": out})
             tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": out})
 
