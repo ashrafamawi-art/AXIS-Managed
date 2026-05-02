@@ -439,29 +439,130 @@ def _gh_dispatch(name: str, inp: dict) -> str:
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
+# File extensions we are willing to fetch for analysis.
+_GH_TEXT_EXTS = {".py", ".md", ".yaml", ".yml", ".json", ".txt", ".js", ".ts", ".sh", ".toml"}
+
+
+def _gh_fetch_for_task(task: str) -> dict:
+    """
+    Proactively fetch relevant files from GitHub REST API based on the task text.
+    Called before Claude runs so reading is always done via API, never from local disk.
+
+    Returns:
+        {
+            "repo":    str,           # resolved repo name
+            "context": str,           # formatted file content to inject into the prompt
+            "error":   str | None,    # non-None if the API call failed
+        }
+    """
+    headers = _gh_headers()
+
+    # ── 1. Resolve which repo is being discussed ──────────────────────────
+    repo = "AXIS-Managed"   # default
+    # Look for explicit mentions: "AXIS-Managed", "AXIS", or any word that matches a repo name
+    known_repos_r = requests.get(
+        f"{_GH_BASE}/users/{_GH_OWNER}/repos?per_page=50&type=all",
+        headers=headers, timeout=10,
+    )
+    known_repos: list[str] = []
+    if known_repos_r.status_code == 200:
+        known_repos = [x["name"] for x in known_repos_r.json()]
+    for name in sorted(known_repos, key=len, reverse=True):   # longest match first
+        if name.lower() in task.lower():
+            repo = name
+            break
+
+    # ── 2. List root files in the repo ───────────────────────────────────
+    r = requests.get(
+        f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/",
+        headers=headers, timeout=10,
+    )
+    if r.status_code != 200:
+        return {"repo": repo, "context": "", "error": f"Cannot list {repo}: {r.status_code} {r.text[:200]}"}
+
+    all_entries = r.json()
+    text_files  = [e["name"] for e in all_entries if e["type"] == "file"
+                   and Path(e["name"]).suffix.lower() in _GH_TEXT_EXTS]
+    _gh_log("list_files", f"{repo}/ → {text_files}")
+
+    # ── 3. Detect which specific files the task is asking about ──────────
+    task_lower = task.lower()
+    to_read: list[str] = []
+
+    # Explicit filename with extension (e.g. "maestro.py", "requirements.txt")
+    for fname in text_files:
+        if fname.lower() in task_lower:
+            to_read.append(fname)
+
+    # Bare name without extension (e.g. "maestro", "security")
+    if not to_read:
+        for fname in text_files:
+            stem = Path(fname).stem.lower()
+            if stem and stem in task_lower:
+                to_read.append(fname)
+
+    # No specific file → read the first few Python files (general review)
+    if not to_read:
+        to_read = [f for f in text_files if f.endswith(".py")][:3]
+
+    # ── 4. Fetch each file from GitHub API ───────────────────────────────
+    sections = [f"[GitHub: {_GH_OWNER}/{repo} — fetched via REST API]",
+                f"Files in repo: {', '.join(text_files)}"]
+
+    for fname in to_read[:4]:   # max 4 files to stay within token limits
+        r = requests.get(
+            f"{_GH_BASE}/repos/{_GH_OWNER}/{repo}/contents/{fname}",
+            headers=headers, timeout=10,
+        )
+        if r.status_code != 200:
+            sections.append(f"\n--- {fname} (fetch failed: {r.status_code}) ---")
+            continue
+        raw = base64.b64decode(r.json()["content"]).decode("utf-8", errors="replace")
+        # Truncate very large files to avoid blowing token budget
+        if len(raw) > 10_000:
+            raw = raw[:10_000] + "\n... [truncated at 10 000 chars]"
+        sections.append(f"\n--- {fname} ({len(raw)} chars) ---\n{raw}")
+        _gh_log("read_file", f"{repo}/{fname} for analysis")
+
+    return {"repo": repo, "context": "\n\n".join(sections), "error": None}
+
+
 # GitHub Developer Agent — reads all repos, writes to ai-dev only, opens PRs
 def github_agent(task: str, client: anthropic.Anthropic) -> dict:
     """
-    Agentic GitHub developer: reads any repo, proposes and implements changes
-    on the ai-dev branch, then opens a PR. Never touches main directly.
-    Runs a tool-use loop (max 20 rounds) until Claude calls end_turn.
+    1. Fetches repo contents eagerly via GitHub REST API (guaranteed — no local filesystem).
+    2. Injects the fetched content into Claude's context for analysis.
+    3. Runs a tool-use loop only if Claude wants to propose and commit changes.
     """
+    # ── Step 1: fetch from GitHub API now, before Claude runs ────────────
+    fetched = _gh_fetch_for_task(task)
+    if fetched["error"]:
+        return {"answer": f"GitHub API error: {fetched['error']}", "artifacts": {}}
+
+    repo    = fetched["repo"]
+    context = fetched["context"]
+    _gh_log("github_agent_start", f"repo={repo}, task={task[:80]}")
+
+    # ── Step 2: build the prompt with the real file content ───────────────
     system = (
-        f"You are AXIS GitHub Developer Agent for the account '{_GH_OWNER}'.\n\n"
-        "Hard rules — never break these:\n"
-        f"1. All writes go ONLY to the '{_GH_BRANCH}' branch — NEVER to main.\n"
+        f"You are AXIS GitHub Developer Agent for '{_GH_OWNER}'.\n\n"
+        "The file contents below were fetched live from GitHub REST API — NOT from local disk.\n"
+        "Analyse them and respond to the user's request.\n\n"
+        "Hard rules:\n"
+        f"1. All writes go ONLY to '{_GH_BRANCH}' branch — NEVER to main.\n"
         "2. After writing files, ALWAYS open a Pull Request with create_pull_request.\n"
-        "3. NEVER include secrets, API keys, tokens, or passwords in any file.\n"
-        "4. NEVER delete repositories or branches.\n"
-        "5. NEVER auto-merge PRs — Ashraf must review and merge manually.\n\n"
-        "Workflow: list_repos → list_files → read_file → analyse → write_file → create_pull_request.\n"
-        "Respond to the user in Arabic. Explain clearly what you read, what you changed, and why."
+        "3. NEVER include secrets, API keys, or tokens in any file.\n"
+        "4. NEVER delete repos or branches.\n"
+        "5. NEVER auto-merge PRs — Ashraf must review manually.\n\n"
+        "Respond in Arabic. Be specific about what you found and what you recommend."
     )
 
-    messages: list[dict]  = [{"role": "user", "content": task}]
-    artifacts: dict       = {}
+    user_message = f"{task}\n\n{context}"
+    messages: list[dict] = [{"role": "user", "content": user_message}]
+    artifacts: dict      = {}
 
-    for _ in range(20):   # cap at 20 tool rounds to avoid runaway loops
+    # ── Step 3: tool-use loop (Claude may write files and open a PR) ──────
+    for _ in range(15):
         resp = client.messages.create(
             model="claude-opus-4-7",
             max_tokens=4096,
@@ -480,10 +581,8 @@ def github_agent(task: str, client: anthropic.Anthropic) -> dict:
         if resp.stop_reason != "tool_use":
             break
 
-        # Append assistant turn
         messages.append({"role": "assistant", "content": resp.content})
 
-        # Execute every tool call in this round
         tool_results = []
         for block in resp.content:
             if getattr(block, "type", None) != "tool_use":
@@ -494,7 +593,6 @@ def github_agent(task: str, client: anthropic.Anthropic) -> dict:
                 "tool_use_id": block.id,
                 "content":     result_str,
             })
-            # Surface PR URLs in artifacts
             try:
                 parsed = json.loads(result_str)
                 if "pr_url" in parsed:
@@ -504,7 +602,7 @@ def github_agent(task: str, client: anthropic.Anthropic) -> dict:
 
         messages.append({"role": "user", "content": tool_results})
 
-    return {"answer": "GitHub agent finished (tool round limit reached).", "artifacts": artifacts}
+    return {"answer": "GitHub agent finished.", "artifacts": artifacts}
 
 
 _AGENT_MAP = {
