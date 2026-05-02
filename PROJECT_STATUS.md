@@ -197,12 +197,119 @@ If `GOOGLE_TOKEN_JSON` is not set on Render, the executor returns:
 
 ---
 
+---
+
+## Proactive Mode (`scheduler.py`)
+
+AXIS runs a background scheduler that monitors tasks and fires reminders autonomously.
+
+### How it works
+
+- Starts as a **daemon thread** inside `axis-api` at startup (FastAPI lifespan)
+- Polls `/tmp/axis/tasks.jsonl` every **60 seconds**
+- Two checks per tick:
+  1. **Due tasks** — any `status=scheduled` task whose `due_at ≤ now`
+  2. **Stale pending** — any `status=pending_confirmation` task older than 15 minutes
+
+### Safety model
+
+| Intent | Scheduler action |
+|---|---|
+| `reminder` | ✅ Auto-execute — sends Telegram message, marks `completed` |
+| `follow_up` | ✅ Auto-execute — sends Telegram message, marks `completed` |
+| `calendar_event` | 📣 Notify-only — sends "event starting now", marks `completed` |
+| `message_to_person` | 🚫 Never auto-executed — user must confirm |
+| `general_question`, `research_task`, `coding_task` | Generic due notification if due_at set |
+
+### Reminder flow (end-to-end)
+
+```
+User: "Remind me to call Bassam in 1 minute"
+  → task_manager.parse()  extracts due_at = now + 1min
+  → maestro proposal gate: REMINDER with due_at → defer to scheduler
+  → Response: "⏰ Got it! I'll remind you: Call with Bassam at 3:01 PM"
+  → task saved: status=scheduled, due_at=<1 min from now>
+  ... 60 seconds later ...
+  → scheduler._tick() fires
+  → due_at ≤ now  →  _execute_due_task()
+  → Telegram: "🔔 Reminder: Call with Bassam"
+  → task updated: status=completed
+```
+
+### Pending reminder flow
+
+```
+User: "Add meeting with Bassam tomorrow at 3pm"
+  → maestro: requires_confirmation → shows proposal card
+  → task saved: status=pending_confirmation
+  ... 15 minutes pass, user hasn't replied ...
+  → scheduler._tick() → age ≥ 15min → _remind_pending()
+  → Telegram: "⏳ Pending task awaiting your confirmation: Meeting with Bassam ..."
+```
+
+### Logging
+
+Every scheduler decision is appended to `/tmp/axis/scheduler.log`:
+```json
+{"ts": "2026-05-02T...", "event": "due_task", "task_id": "...", "decision": "executed", "detail": "intent=reminder title='Call with Bassam'"}
+```
+
+---
+
+## Task Manager (`task_manager.py`)
+
+Structured task lifecycle: parse → (optionally confirm) → scheduled → completed/failed/cancelled.
+
+### Intents
+
+| Intent | Requires confirmation | Persisted | Auto-executable by scheduler |
+|---|---|---|---|
+| `calendar_event` | ✅ | ✅ | 📣 notify-only |
+| `reminder` | ❌ | ✅ | ✅ auto-execute |
+| `follow_up` | ✅ | ✅ | ✅ auto-execute |
+| `message_to_person` | ✅ | ✅ | 🚫 never |
+| `research_task` | ❌ | ❌ | — |
+| `coding_task` | ❌ | ❌ | — |
+| `general_question` | ❌ | ❌ | — |
+
+### Confirmation flow
+
+```
+User: "Add meeting with Bassam tomorrow at 3pm"
+  → maestro parses → requires_confirmation=True
+  → saves task (status=pending_confirmation)
+  → returns: "📋 AXIS Task Proposal ... Reply confirm to execute"
+
+User: "confirm"  (or yes / ok / go ahead)
+  → maestro confirmation handler finds latest pending task
+  → re-runs original message through full pipeline with __SKIP_CONFIRM__ prefix
+  → updates task: status=completed / failed
+```
+
+### Storage
+
+Tasks are stored as JSON lines in `$AXIS_DATA_DIR/tasks.jsonl` (default `/tmp/axis/tasks.jsonl`).
+
+**Note:** On Render, `axis-api` and `axis-telegram` are separate containers — they do not share `/tmp/axis/`. All task read/write must go through the `axis-api` REST endpoints (`GET /tasks`, `GET /tasks/pending`, `DELETE /tasks/{task_id}`).
+
+### Telegram commands
+
+| Command | Action |
+|---|---|
+| `/tasks` | List last 20 tasks with status |
+| `/pending` | List tasks awaiting confirmation |
+| `/cancel <id>` | Cancel a task by its 8-char ID prefix |
+
+---
+
 ## Files
 
 | File | Role |
 |---|---|
-| `server.py` | FastAPI server — POST /task routes through Maestro |
-| `maestro.py` | Orchestration — security + intent routing + agent dispatch |
+| `server.py` | FastAPI server — POST /task, GET/DELETE /tasks, starts scheduler |
+| `maestro.py` | Orchestration — security + intent routing + agent dispatch + task proposal gate |
+| `scheduler.py` | Background scheduler — proactive reminders and follow-ups |
+| `task_manager.py` | Task lifecycle — parse, save, update, confirm, list |
 | `security.py` | Security layer — prompt inspection, risk classification, action veto |
 | `council.py` | Multi-perspective pre-analysis (5 lenses) |
 | `executor.py` | Tool planning + execution (create_calendar_event, save_task, notifications, HTTP) |

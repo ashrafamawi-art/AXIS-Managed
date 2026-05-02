@@ -333,13 +333,25 @@ def _build_title(text: str, intent: str, person: str) -> str:
 
 def _extract_due_at(text: str) -> str:
     """
-    Extract a rough due_at ISO string from natural language.
-    Exact resolution of relative dates ("tomorrow", "next Monday") happens
-    inside executor via Claude — this is just for preview display.
+    Extract a due_at ISO-8601 string (UTC) from natural language.
+    "in X minutes/hours" is computed exactly here.
+    Relative dates ("tomorrow", "next Monday") are approximate — exact resolution
+    happens inside the executor via Claude.
     """
     lower = text.lower()
-    now   = datetime.now()
+    now   = datetime.now(timezone.utc)
 
+    # "in X minutes / hours" — always exact, always UTC
+    dur_m = re.search(
+        r'\bin\s+(\d+)\s+(minute|minutes|min|mins|hour|hours|hr|hrs)\b', lower
+    )
+    if dur_m:
+        qty  = int(dur_m.group(1))
+        unit = dur_m.group(2)
+        delta = timedelta(hours=qty) if ("hour" in unit or "hr" in unit) else timedelta(minutes=qty)
+        return (now + delta).isoformat()
+
+    # "at H[:MM] [am/pm]"
     time_m = re.search(r'\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', lower)
     if not time_m:
         return ""

@@ -847,6 +847,24 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
                 "artifacts": {},
                 "timestamp": ts,
             }
+        elif _task_rec.intent == _tm.REMINDER and _task_rec.due_at:
+            # Future reminder — defer execution to the scheduler; don't run pipeline now.
+            _tm.save(_task_rec)
+            try:
+                dt      = datetime.fromisoformat(_task_rec.due_at)
+                due_str = dt.strftime("%-I:%M %p")
+            except Exception:
+                due_str = _task_rec.due_at[:16]
+            return {
+                "id":        str(uuid.uuid4()),
+                "task":      actual_task,
+                "status":    "done",
+                "answer":    f"⏰ Got it! I'll remind you: *{_task_rec.title}* at {due_str}",
+                "security":  {"risk": sec["risk"], "reason": sec["reason"]},
+                "routing":   {"intent": intent},
+                "artifacts": {},
+                "timestamp": ts,
+            }
         elif _task_rec.intent in _tm.PERSIST_INTENTS:
             _tm.save(_task_rec)
 

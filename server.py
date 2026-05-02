@@ -22,6 +22,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from pydantic import BaseModel
 import council
 import executor
 import maestro
+import scheduler
 import task_manager as _tm
 
 # ---------------------------------------------------------------------------
@@ -83,7 +85,15 @@ except OSError:
     raise RuntimeError("ANTHROPIC_API_KEY env var not set and ~/.anthropic_key not found.")
 
 client = anthropic.Anthropic(api_key=api_key)
-app    = FastAPI(title="AXIS API", version="1.0")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    scheduler.start()
+    yield
+
+
+app = FastAPI(title="AXIS API", version="1.0", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
 # AXIS session management
