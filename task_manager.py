@@ -4,9 +4,18 @@ AXIS Task Manager — structured task parsing, lifecycle management, and local s
 Each task is stored as one JSON line in /tmp/axis/tasks.jsonl.
 
 Intents:   calendar_event | reminder | follow_up | message_to_person |
-           research_task  | coding_task | general_question
+           message_send | delete_action |
+           research_task | coding_task | general_question
 Statuses:  pending_confirmation | scheduled | completed | failed |
            waiting_for_user | cancelled
+
+Confirmation policy v2 — confirmation is required ONLY for:
+  delete_action  — any deletion (events, tasks, files)
+  message_send   — actually transmitting a message/email to someone
+  irreversible   — anything explicitly flagged as irreversible
+
+Everything else (create, update, draft, research, reminders, follow-ups)
+executes immediately with no friction.
 """
 
 import dataclasses
@@ -26,7 +35,9 @@ from typing import Optional
 CALENDAR_EVENT   = "calendar_event"
 REMINDER         = "reminder"
 FOLLOW_UP        = "follow_up"
-MESSAGE_PERSON   = "message_to_person"
+MESSAGE_PERSON   = "message_to_person"   # draft / compose — no confirmation
+MESSAGE_SEND     = "message_send"        # actually sending to someone — confirmation required
+DELETE_ACTION    = "delete_action"       # any deletion — confirmation required
 RESEARCH_TASK    = "research_task"
 CODING_TASK      = "coding_task"
 GENERAL_QUESTION = "general_question"
@@ -60,11 +71,11 @@ _TASKS_FILE = _DATA_DIR / "tasks.jsonl"
 _LOG_FILE   = _DATA_DIR / "task_manager.log"
 _FILE_LOCK  = threading.Lock()
 
-# Real-world actions that need explicit user confirmation
-REQUIRES_CONFIRMATION = {CALENDAR_EVENT, MESSAGE_PERSON, FOLLOW_UP}
+# Confirmation policy v2: only delete and send actions require confirmation
+REQUIRES_CONFIRMATION = {DELETE_ACTION, MESSAGE_SEND}
 
-# Intents worth persisting to tasks.jsonl (reminders + above)
-PERSIST_INTENTS = {CALENDAR_EVENT, REMINDER, FOLLOW_UP, MESSAGE_PERSON}
+# Intents worth persisting to tasks.jsonl
+PERSIST_INTENTS = {CALENDAR_EVENT, REMINDER, FOLLOW_UP, MESSAGE_PERSON, MESSAGE_SEND, DELETE_ACTION}
 
 # Confirmation words — entire stripped message must match one of these
 _CONFIRM_WORDS = {
@@ -77,6 +88,14 @@ _CONFIRM_WORDS = {
 # Intent detection keyword sets
 # ---------------------------------------------------------------------------
 
+_DELETE_KW = {
+    "delete", "remove", "cancel", "erase", "clear",
+    "حذف", "امسح", "ألغِ", "احذف",
+}
+_SEND_KW = {
+    "send", "sending", "email", "forward", "deliver",
+    "ارسل", "ابعث",
+}
 _CALENDAR_KW = {
     "meeting", "schedule", "appointment", "call", "session",
     "book", "arrange", "add to calendar", "block time",
@@ -92,10 +111,14 @@ _FOLLOWUP_KW = {
     "check in", "check back", "get back to",
     "متابعة", "تابع",
 }
+_DRAFT_KW = {
+    "draft", "compose",
+    "اكتب رسالة", "حضر",
+}
 _MESSAGE_KW = {
-    "message", "send", "tell", "contact",
-    "text", "whatsapp", "email", "reach out",
-    "رسالة", "ارسل", "تواصل",
+    "message", "tell", "contact", "text", "whatsapp",
+    "write to", "reach out",
+    "رسالة", "تواصل",
 }
 _RESEARCH_KW = {
     "research", "find", "search", "look up",
@@ -255,6 +278,15 @@ def get_latest_pending() -> Optional[TaskRecord]:
 
 def _detect_intent(text: str) -> str:
     lower = text.lower()
+    # DELETE first — "cancel meeting" beats calendar
+    if any(kw in lower for kw in _DELETE_KW):
+        return DELETE_ACTION
+    # DRAFT beats SEND — "draft an email" / "compose a message" → no confirmation
+    if any(kw in lower for kw in _DRAFT_KW):
+        return MESSAGE_PERSON
+    # SEND after draft guard — "send email to X" requires confirmation
+    if any(kw in lower for kw in _SEND_KW):
+        return MESSAGE_SEND
     if any(kw in lower for kw in _REMINDER_KW):
         return REMINDER
     if any(kw in lower for kw in _FOLLOWUP_KW):
@@ -268,6 +300,15 @@ def _detect_intent(text: str) -> str:
     if any(kw in lower for kw in _RESEARCH_KW):
         return RESEARCH_TASK
     return GENERAL_QUESTION
+
+
+def requires_confirmation(action_type: str, is_irreversible: bool = False) -> bool:
+    """
+    Confirmation policy v2.
+    Returns True only for: delete actions, send actions, or explicitly irreversible actions.
+    Everything else (create, update, draft, research, reminders) returns False.
+    """
+    return action_type in REQUIRES_CONFIRMATION or is_irreversible
 
 
 _NON_NAMES = {
@@ -306,6 +347,10 @@ def _build_title(text: str, intent: str, person: str) -> str:
         base = "Call"
     elif "remind" in lower:
         base = "Reminder"
+    elif intent == DELETE_ACTION:
+        base = "Delete"
+    elif intent == MESSAGE_SEND:
+        base = "Send"
     elif intent == MESSAGE_PERSON:
         base = "Message"
     elif intent == CALENDAR_EVENT:
@@ -318,7 +363,7 @@ def _build_title(text: str, intent: str, person: str) -> str:
         base = "Task"
 
     if person:
-        connector = "to" if intent == MESSAGE_PERSON else "with"
+        connector = "to" if intent in {MESSAGE_PERSON, MESSAGE_SEND} else "with"
         return f"{base} {connector} {person}"
 
     m = re.search(
@@ -418,8 +463,18 @@ def is_confirmation_text(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def format_confirmation_request(record: TaskRecord) -> str:
-    """Build the confirmation prompt shown to the user before executing."""
-    lines = ["📋 *AXIS Task Proposal*\n"]
+    """Build the confirmation prompt for delete or send actions."""
+    if record.intent == DELETE_ACTION:
+        header  = "⚠️ *Confirm deletion*"
+        cta     = "Are you sure? Reply **confirm** to delete, or ignore to cancel."
+    elif record.intent == MESSAGE_SEND:
+        header  = "📤 *Confirm send*"
+        cta     = "Reply **confirm** to send, or ignore to cancel."
+    else:
+        header  = "⚠️ *Confirm action*"
+        cta     = "Reply **confirm** to proceed, or ignore to cancel."
+
+    lines = [f"{header}\n"]
     lines.append(f"**{record.title}**")
 
     if record.due_at:
@@ -434,10 +489,7 @@ def format_confirmation_request(record: TaskRecord) -> str:
 
     lines.append(f'\n_"{record.user_message}"_')
     lines.append(f"Task ID: `{record.task_id[:8]}`")
-    lines.append(
-        "\nReply **confirm** (or yes / ok / go ahead) to execute, "
-        "or simply ignore to cancel."
-    )
+    lines.append(f"\n{cta}")
     return "\n".join(lines)
 
 

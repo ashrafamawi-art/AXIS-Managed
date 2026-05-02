@@ -256,6 +256,49 @@ Every scheduler decision is appended to `/tmp/axis/scheduler.log`:
 
 ---
 
+## Confirmation Policy v2 — minimal friction
+
+**Principle:** AXIS should feel instant. Confirmation is rare and reserved for irreversible harm only.
+
+### When confirmation IS required
+
+| Trigger | Intent | Example |
+|---|---|---|
+| Delete anything | `delete_action` | "Delete my meeting tomorrow" |
+| Send to someone | `message_send` | "Send this email to Bassam" |
+| Explicit irreversible | `is_irreversible=True` | Programmatic flag |
+
+### When confirmation is NOT required
+
+Everything else executes immediately:
+- Create/update calendar events
+- Reminders and follow-ups
+- Drafting messages ("Write a message to Bassam")
+- Research, summarization, analysis
+- Memory read/write
+- Task organization
+
+### Implementation
+
+```python
+requires_confirmation(action_type, is_irreversible=False)
+# Returns True only if action_type in {"delete_action", "message_send"} or is_irreversible
+```
+
+Detection priority in `_detect_intent()`:
+1. `_DELETE_KW` → `delete_action` ("delete", "remove", "cancel", "erase")
+2. `_DRAFT_KW` → `message_to_person` ("draft", "compose") — overrides "email" in send set
+3. `_SEND_KW` → `message_send` ("send", "email", "forward")
+4. Everything else — existing priority order
+
+### Confirmation prompt format
+
+- Delete: `⚠️ Confirm deletion — Are you sure? Reply confirm to delete...`
+- Send: `📤 Confirm send — Reply confirm to send...`
+- No generic "AXIS Task Proposal" for non-critical actions
+
+---
+
 ## Task Manager (`task_manager.py`)
 
 Structured task lifecycle: parse → (optionally confirm) → scheduled → completed/failed/cancelled.

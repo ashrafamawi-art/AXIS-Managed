@@ -89,8 +89,8 @@ _AUTO_EXECUTE = {_tm.REMINDER, _tm.FOLLOW_UP}
 # Intents that get a heads-up notification but no side effects
 _NOTIFY_ONLY  = {_tm.CALENDAR_EVENT}
 
-# Intents that must never be auto-executed — require explicit user confirmation
-_SKIP_ALWAYS  = {_tm.MESSAGE_PERSON}
+# Intents the scheduler never auto-executes — must go through user confirmation
+_SKIP_ALWAYS  = {_tm.MESSAGE_PERSON, _tm.MESSAGE_SEND, _tm.DELETE_ACTION}
 
 
 def _execute_due_task(task: _tm.TaskRecord) -> None:
