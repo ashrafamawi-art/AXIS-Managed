@@ -8,15 +8,63 @@ execute() — runs one sub-task through the Claude tool-use loop
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
 import requests as http_lib
 
-_MODEL     = "claude-sonnet-4-6"
-_DATA_DIR  = Path(os.environ.get("AXIS_DATA_DIR", str(Path(__file__).parent)))
+_MODEL      = "claude-sonnet-4-6"
+_DATA_DIR   = Path(os.environ.get("AXIS_DATA_DIR", str(Path(__file__).parent)))
 _TASKS_FILE = _DATA_DIR / "tasks.md"
+_TOKEN_FILE = _DATA_DIR / "token.pickle"
+
+# ---------------------------------------------------------------------------
+# Google Calendar credentials — cloud-first, local fallback
+# ---------------------------------------------------------------------------
+
+_gcal_creds_cache = None
+
+
+def _load_gcal_creds():
+    """Load Google Calendar creds: GOOGLE_TOKEN_JSON (cloud) → token.pickle (local dev)."""
+    global _gcal_creds_cache
+    try:
+        from google.auth.transport.requests import Request
+
+        if _gcal_creds_cache is not None:
+            if _gcal_creds_cache.valid:
+                return _gcal_creds_cache
+            if _gcal_creds_cache.expired and _gcal_creds_cache.refresh_token:
+                _gcal_creds_cache.refresh(Request())
+                return _gcal_creds_cache
+
+        token_json = os.environ.get("GOOGLE_TOKEN_JSON", "")
+        if token_json:
+            from google.oauth2.credentials import Credentials
+            scopes = ["https://www.googleapis.com/auth/calendar.events"]
+            creds  = Credentials.from_authorized_user_info(json.loads(token_json), scopes)
+            if not creds.valid and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            _gcal_creds_cache = creds
+            return creds
+
+        if _TOKEN_FILE.exists():
+            import pickle
+            with _TOKEN_FILE.open("rb") as f:
+                creds = pickle.load(f)
+            if creds.valid:
+                _gcal_creds_cache = creds
+                return creds
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with _TOKEN_FILE.open("wb") as f:
+                    pickle.dump(creds, f)
+                _gcal_creds_cache = creds
+                return creds
+    except Exception:
+        pass
+    return None
 
 # ---------------------------------------------------------------------------
 # Tool implementations
@@ -63,13 +111,81 @@ def _http_request(url: str, method: str = "GET",
         return f"Error: {exc}"
 
 
+def _create_calendar_event(
+    title: str,
+    start_iso: str,
+    end_iso: str = "",
+    description: str = "",
+    location: str = "",
+    **_,
+) -> str:
+    """Create a Google Calendar event. Falls back to save_task if credentials missing."""
+    try:
+        creds = _load_gcal_creds()
+        if creds is None:
+            _save_task(
+                task=f"[PENDING CALENDAR] {title} — {start_iso}",
+                priority="high",
+            )
+            return (
+                "Google Calendar credentials are not configured on Render. "
+                "Task saved as pending."
+            )
+
+        from calendar_integration import CalendarService
+
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt   = datetime.fromisoformat(end_iso) if end_iso else start_dt + timedelta(hours=1)
+
+        cal       = CalendarService(creds=creds)
+        conflicts = cal.check_conflicts(start_dt, end_dt)
+        conflict_note = ""
+        if conflicts:
+            names = [c.get("summary", "Untitled") for c in conflicts[:2]]
+            conflict_note = f" ⚠️ Conflict with: {', '.join(names)}"
+
+        event    = cal.create_event(title, start_dt, end_dt, description, location)
+        fmt_time = start_dt.strftime("%a %b %-d at %-I:%M %p")
+        return f"CALENDAR_EVENT_CREATED: '{title}' on {fmt_time}{conflict_note}"
+
+    except Exception as exc:
+        try:
+            _save_task(
+                task=f"[PENDING CALENDAR] {title} — {start_iso}",
+                priority="high",
+            )
+        except Exception:
+            pass
+        return f"Calendar execution failed, task saved as pending. Error: {exc}"
+
+
 _DISPATCH = {
-    "send_notification": _send_notification,
-    "save_task":         _save_task,
-    "http_request":      _http_request,
+    "create_calendar_event": _create_calendar_event,
+    "send_notification":     _send_notification,
+    "save_task":             _save_task,
+    "http_request":          _http_request,
 }
 
 TOOLS = [
+    {
+        "name": "create_calendar_event",
+        "description": (
+            "Create a Google Calendar event. Use whenever the user asks to schedule, "
+            "book, or arrange a meeting, call, or appointment. "
+            "Resolve relative dates (today, tomorrow, next Monday) using today's date from the system prompt."
+        ),
+        "input_schema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "title":       {"type": "string", "description": "Event title"},
+                "start_iso":   {"type": "string", "description": "Start datetime ISO 8601, e.g. '2026-05-03T15:00:00'"},
+                "end_iso":     {"type": "string", "description": "End datetime ISO 8601. Defaults to 1 hour after start."},
+                "description": {"type": "string", "description": "Optional notes or agenda"},
+                "location":    {"type": "string", "description": "Optional location"},
+            },
+            "required": ["title", "start_iso"],
+        },
+    },
     {
         "name": "send_notification",
         "description": (
@@ -167,11 +283,17 @@ def plan(task: str, axis_response: str, memory_ctx: str,
 # Execute
 # ---------------------------------------------------------------------------
 
-_EXEC_SYSTEM = """\
-You are the AXIS Execution Engine. Act on the sub-task autonomously.
-Call one or more tools as needed. Be specific — extract names, times, context.
-If no real-world action is warranted, call no tools.
-"""
+def _exec_system() -> str:
+    now = datetime.now()
+    return (
+        f"You are the AXIS Execution Engine. Today is {now.strftime('%A, %B %-d, %Y')} "
+        f"(local time {now.strftime('%-I:%M %p')}).\n"
+        "Act on the sub-task autonomously using available tools. "
+        "Be specific — extract names, times, and context from the task.\n"
+        "When creating calendar events, resolve relative dates (today, tomorrow, next Monday) "
+        "using today's date above. Default event duration is 1 hour unless stated otherwise.\n"
+        "If no real-world action is warranted, call no tools."
+    )
 
 
 def execute(sub_task: str, context: str, client: anthropic.Anthropic) -> list[dict]:
@@ -186,7 +308,7 @@ def execute(sub_task: str, context: str, client: anthropic.Anthropic) -> list[di
         resp = client.messages.create(
             model=_MODEL,
             max_tokens=1024,
-            system=_EXEC_SYSTEM,
+            system=_exec_system(),
             tools=TOOLS,
             messages=messages,
         )

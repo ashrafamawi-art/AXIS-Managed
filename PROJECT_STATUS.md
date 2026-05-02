@@ -143,6 +143,10 @@ MEDIUM-risk tasks always override intent classification and route to `general_ag
 
 **axis-api only:**
 - `AXIS_SESSION_ID` (optional)
+- `GOOGLE_TOKEN_JSON` — required for calendar creation via Telegram/REST. Generate with:
+  `python3 -c "import pickle,json; c=pickle.load(open('token.pickle','rb')); print(c.to_json())"`
+- `TELEGRAM_TOKEN` (for HIGH-risk security alerts)
+- `TELEGRAM_USER_ID` (admin ID to receive alerts)
 
 **axis-chat only:**
 - `GOOGLE_TOKEN_JSON`
@@ -157,6 +161,42 @@ MEDIUM-risk tasks always override intent classification and route to `general_ag
 
 ---
 
+## Runtime Architecture Requirement
+
+**All production execution must be cloud-based (Render).**
+
+| Service | Runtime | Notes |
+|---|---|---|
+| `axis-api` | Render (cloud) | REST API — handles ALL calendar/task execution |
+| `axis-chat` | Render (cloud) | Chainlit UI — has its own calendar path |
+| `axis-telegram` | Render (cloud) | Forwards to axis-api |
+
+**Local services (laptop/terminal) are for development and testing only.**  
+Production must never depend on:
+- The developer laptop being online
+- Claude Code / local terminal running
+- `token.pickle` on disk (use `GOOGLE_TOKEN_JSON` env var on Render)
+- `*.axis.local`, `localhost`, or `127.0.0.1` service URLs
+
+### Calendar execution path (Telegram → Render)
+
+```
+Telegram message
+  → telegram_bot.py (Render worker)
+  → POST axis-api.onrender.com/task
+  → server.py → maestro.run() → calendar_agent() → general_agent()
+  → executor.execute()  ← create_calendar_event tool lives HERE
+  → _create_calendar_event()
+      ├─ loads GOOGLE_TOKEN_JSON from env  ← cloud credential
+      ├─ calls Google Calendar API directly from Render
+      └─ on failure: saves pending task + returns clear error message
+```
+
+If `GOOGLE_TOKEN_JSON` is not set on Render, the executor returns:
+> "Google Calendar credentials are not configured on Render. Task saved as pending."
+
+---
+
 ## Files
 
 | File | Role |
@@ -165,7 +205,7 @@ MEDIUM-risk tasks always override intent classification and route to `general_ag
 | `maestro.py` | Orchestration — security + intent routing + agent dispatch |
 | `security.py` | Security layer — prompt inspection, risk classification, action veto |
 | `council.py` | Multi-perspective pre-analysis (5 lenses) |
-| `executor.py` | Tool planning + execution (save_task, notifications, HTTP) |
+| `executor.py` | Tool planning + execution (create_calendar_event, save_task, notifications, HTTP) |
 | `chat.py` | Chainlit web UI with Google Calendar integration |
 | `telegram_bot.py` | Telegram bot — forwards to axis-api via HTTP |
 | `session_runner.py` | CLI autonomous loop (local development) |

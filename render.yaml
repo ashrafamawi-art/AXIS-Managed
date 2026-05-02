@@ -46,6 +46,8 @@ services:
         sync: false                  # needed for security alerts
       - key: TELEGRAM_USER_ID
         sync: false                  # admin user to receive HIGH-risk alerts
+      - key: GOOGLE_TOKEN_JSON
+        sync: false                  # JSON from: python3 -c "import pickle,json; c=pickle.load(open('token.pickle','rb')); print(c.to_json())"
 
   # ── Telegram bot worker ────────────────────────────────────────────────────
   - type: worker
