@@ -345,6 +345,40 @@ Tasks are stored as JSON lines in `$AXIS_DATA_DIR/tasks.jsonl` (default `/tmp/ax
 
 ---
 
+## Daily Briefing (`briefing.py`)
+
+Every morning at **7:00 AM Asia/Riyadh time** AXIS sends an automatic Arabic Telegram summary.
+
+### Content
+
+| Section | Source |
+|---|---|
+| 📅 Today's calendar events (with local times) | Google Calendar — today's events |
+| 📆 Next 3 days (notable events worth preparing for) | Google Calendar — tomorrow → +3 days |
+| ⏳ Pending / unresolved items | `tasks.jsonl` — `pending_confirmation` + `scheduled` tasks from last 7 days |
+| 🧠 Recent memory context (optional enrichment) | Supabase `axis_memory` — last 7 entries |
+
+### How it works
+
+- The scheduler calls `_check_daily_briefing()` on every 60s tick
+- Fires once per process lifetime when `riyadh_hour == 7` and today's date hasn't been sent yet
+- `briefing.compose_briefing()` fetches all data, builds a structured Arabic prompt, calls Haiku
+- Falls back to a plain-text Arabic briefing if Claude fails
+- Sent via the existing `_send_telegram()` helper in `scheduler.py`
+- Requires the same credentials as the rest of `axis-api`: `GOOGLE_TOKEN_JSON`, `TELEGRAM_TOKEN`, `TELEGRAM_USER_ID`
+
+### Timezone
+
+Asia/Riyadh = UTC+3, no DST — computed as `datetime.now(UTC) + timedelta(hours=3)`.
+
+### Log entries
+
+```json
+{"ts": "...", "event": "briefing", "task_id": "", "decision": "sent", "detail": "date=2026-05-02"}
+```
+
+---
+
 ## Files
 
 | File | Role |
@@ -360,3 +394,4 @@ Tasks are stored as JSON lines in `$AXIS_DATA_DIR/tasks.jsonl` (default `/tmp/ax
 | `telegram_bot.py` | Telegram bot — forwards to axis-api via HTTP |
 | `session_runner.py` | CLI autonomous loop (local development) |
 | `calendar_integration.py` | Google Calendar API wrapper |
+| `briefing.py` | Daily morning briefing — compose + send Arabic Telegram summary |

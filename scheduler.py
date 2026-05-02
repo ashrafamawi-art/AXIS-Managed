@@ -16,12 +16,13 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
 import task_manager as _tm
+import briefing as _briefing
 
 # ---------------------------------------------------------------------------
 # Config
@@ -38,6 +39,14 @@ _LOG_FILE = _DATA_DIR / "scheduler.log"
 
 # task_id → monotonic timestamp of last pending reminder (in-memory only)
 _pending_reminded: dict[str, float] = {}
+
+# ---------------------------------------------------------------------------
+# Daily briefing config
+# ---------------------------------------------------------------------------
+
+_BRIEFING_HOUR         = 7            # fire at 7:xx AM Riyadh time
+_RIYADH_OFFSET         = timedelta(hours=3)   # UTC+3, no DST
+_briefing_sent_date: str = ""         # "YYYY-MM-DD" of last briefing — in-memory guard
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -150,6 +159,38 @@ def _remind_pending(task: _tm.TaskRecord) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Daily briefing
+# ---------------------------------------------------------------------------
+
+def _check_daily_briefing() -> None:
+    """Send the morning briefing once per day at _BRIEFING_HOUR Riyadh local time."""
+    global _briefing_sent_date
+
+    riyadh_now  = datetime.now(timezone.utc) + _RIYADH_OFFSET
+    today_str   = riyadh_now.strftime("%Y-%m-%d")
+
+    if riyadh_now.hour != _BRIEFING_HOUR:
+        return
+    if _briefing_sent_date == today_str:
+        return   # already sent today
+
+    # Mark as sent immediately — prevents a second send if compose() is slow
+    _briefing_sent_date = today_str
+    _log("briefing", "", "composing", f"date={today_str}")
+
+    try:
+        msg = _briefing.compose_briefing()
+        if msg:
+            ok = _send_telegram(msg)
+            _log("briefing", "", "sent" if ok else "telegram_failed", f"date={today_str}")
+        else:
+            _log("briefing", "", "empty_result", f"date={today_str}")
+    except Exception as exc:
+        _log("briefing", "", "error", str(exc))
+        _briefing_sent_date = ""   # allow retry on next tick if composition exploded
+
+
+# ---------------------------------------------------------------------------
 # Scheduler tick
 # ---------------------------------------------------------------------------
 
@@ -187,6 +228,9 @@ def _tick() -> None:
                 _pending_reminded[task.task_id] = now_mono
         except Exception as exc:
             _log("tick_error", task.task_id, "error", f"pending check: {exc}")
+
+    # ── 3. Daily morning briefing ────────────────────────────────────────
+    _check_daily_briefing()
 
 
 # ---------------------------------------------------------------------------
