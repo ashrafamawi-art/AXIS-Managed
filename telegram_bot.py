@@ -48,15 +48,17 @@ def _require(env: str, fallback_file: Path = None) -> str:
 AXIS_API_URL  = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
-api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-if not api_key:
-    raise RuntimeError("ANTHROPIC_API_KEY not set")
-client  = anthropic.Anthropic(api_key=api_key)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_USER_ID  = os.environ.get("TELEGRAM_USER_ID")
 
-_uid = os.environ.get("TELEGRAM_USER_ID", "")
-if not _uid:
-    raise RuntimeError("TELEGRAM_USER_ID not set")
-AUTHORIZED_UID: int = int(_uid)
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY not set")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN not set")
+
+client         = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+AUTHORIZED_UID = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else 0
 
 
 def _authorized(update: Update) -> bool:
@@ -239,14 +241,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def main():
-    token = os.environ.get("TELEGRAM_TOKEN", "")
-    if not token:
-        raise RuntimeError("TELEGRAM_TOKEN not set")
     print(f"[AXIS Telegram] Starting — authorized UID: {AUTHORIZED_UID}")
     print(f"[AXIS Telegram] AXIS API: {AXIS_API_URL}")
     print(f"[AXIS Telegram] Whisper model: {WHISPER_MODEL}")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

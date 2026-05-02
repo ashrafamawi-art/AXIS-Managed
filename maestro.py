@@ -529,33 +529,20 @@ def _gh_fetch_for_task(task: str) -> dict:
 
 # GitHub Developer Agent — reads via API only
 def github_agent(task: str, client: anthropic.Anthropic) -> dict:
-    import requests as _req, base64 as _b64
-
+    import requests, base64, os
     token = os.environ.get("GITHUB_TOKEN", "")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept":        "application/vnd.github+json",
-    }
-
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     url = "https://api.github.com/repos/ashrafamawi-art/AXIS-Managed/contents/maestro.py"
-    r = _req.get(url, headers=headers)
-
+    r = requests.get(url, headers=headers)
     if r.status_code != 200:
-        return {"answer": f"GitHub error {r.status_code}", "artifacts": {}}
-
-    content = _b64.b64decode(r.json()["content"]).decode("utf-8")
-
+        return {"answer": f"GitHub API error: {r.status_code}", "artifacts": {}}
+    content = base64.b64decode(r.json()["content"]).decode("utf-8")
     resp = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=2000,
-        messages=[{
-            "role":    "user",
-            "content": f"راجع هذا الكود واقترح تحسينات بالعربي:\n\n{content[:8000]}",
-        }],
+        messages=[{"role": "user", "content": f"راجع هذا الكود واقترح تحسينات بالعربي:\n\n{content[:8000]}"}]
     )
-
-    answer = resp.content[0].text if resp.content else "لا يوجد جواب"
-    return {"answer": answer, "artifacts": {}}
+    return {"answer": resp.content[0].text, "artifacts": {}}
 
 
 _AGENT_MAP = {
