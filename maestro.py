@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
+import requests
 
 import security
 import council
@@ -74,6 +75,28 @@ def _classify_intent(task: str, client: anthropic.Anthropic) -> str:
         return data.get("intent", "general")
     except Exception:
         return "general"
+
+
+def _send_security_alert(task: str, reason: str, category: str) -> None:
+    """Fire-and-forget Telegram alert to admin when a HIGH-risk request is blocked."""
+    token   = os.environ.get("TELEGRAM_TOKEN", "")
+    user_id = os.environ.get("TELEGRAM_USER_ID", "")
+    if not token or not user_id:
+        return
+    text = (
+        f"🚨 *AXIS Security Alert*\n\n"
+        f"*Category:* `{category}`\n"
+        f"*Reason:* {reason}\n\n"
+        f"*Preview:* `{task[:120]}`"
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": user_id, "text": text, "parse_mode": "Markdown"},
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def _load_memory(n: int = 3) -> str:
@@ -184,15 +207,22 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
     """
     ts = datetime.now(timezone.utc).isoformat()
 
+    # ── 0. Confirm bypass — "confirm <task>" skips MEDIUM block ──────────
+    confirmed = task.lower().startswith("confirm ")
+    actual_task = task[len("confirm "):].strip() if confirmed else task
+
     # ── 1. Security: inspect prompt ───────────────────────────────────────
-    sec = security.inspect_prompt(task)
+    sec      = security.inspect_prompt(actual_task)
+    category = sec.get("category", "unknown")
 
     if sec["blocked"] or sec["risk"] == security.HIGH:
+        _send_security_alert(actual_task, sec["reason"], category)
         return {
             "id":        str(uuid.uuid4()),
-            "task":      task,
+            "task":      actual_task,
             "status":    "blocked",
-            "answer":    f"🔒 Request blocked by AXIS Security Layer.\n\nReason: {sec['reason']}",
+            "reason":    category,
+            "message":   "🚫 Request denied due to security policy.",
             "security":  {"risk": sec["risk"], "reason": sec["reason"]},
             "routing":   {"intent": "blocked"},
             "artifacts": {},
@@ -200,24 +230,36 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
         }
 
     # ── 2. Classify intent ────────────────────────────────────────────────
-    intent = _classify_intent(task, client)
+    intent = _classify_intent(actual_task, client)
 
-    # MEDIUM risk → always route to general_agent (full oversight pipeline)
-    if sec["risk"] == security.MEDIUM:
-        intent = "general"
+    # MEDIUM risk without confirm → hold for user confirmation
+    if sec["risk"] == security.MEDIUM and not confirmed:
+        return {
+            "id":        str(uuid.uuid4()),
+            "task":      actual_task,
+            "status":    "needs_confirmation",
+            "reason":    category,
+            "message":   "⚠️ This action requires your confirmation. Reply 'confirm' to proceed.",
+            "security":  {"risk": sec["risk"], "reason": sec["reason"]},
+            "routing":   {"intent": intent},
+            "artifacts": {},
+            "timestamp": ts,
+        }
 
     # ── 3. Route to agent ─────────────────────────────────────────────────
     agent_fn     = _AGENT_MAP.get(intent, general_agent)
-    agent_result = agent_fn(task, client)
+    agent_result = agent_fn(actual_task, client)
+    agent_name   = agent_fn.__name__
 
     # ── 4. Persist to memory ──────────────────────────────────────────────
-    _save_memory(task, agent_result.get("answer", ""))
+    _save_memory(actual_task, agent_result.get("answer", ""))
 
     # ── 5. Build unified response ─────────────────────────────────────────
     response: dict = {
         "id":        str(uuid.uuid4()),
-        "task":      task,
+        "task":      actual_task,
         "status":    "done",
+        "agent":     agent_name,
         "answer":    agent_result.get("answer", "(no response)"),
         "security":  {"risk": sec["risk"], "reason": sec["reason"]},
         "routing":   {"intent": intent},

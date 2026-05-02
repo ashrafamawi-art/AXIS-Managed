@@ -42,6 +42,10 @@ services:
         sync: false
       - key: AXIS_DATA_DIR
         value: /tmp/axis
+      - key: TELEGRAM_TOKEN
+        sync: false                  # needed for security alerts
+      - key: TELEGRAM_USER_ID
+        sync: false                  # admin user to receive HIGH-risk alerts
 
   # ── Telegram bot worker ────────────────────────────────────────────────────
   - type: worker

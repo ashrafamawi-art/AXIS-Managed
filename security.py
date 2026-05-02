@@ -116,7 +116,7 @@ def inspect_prompt(text: str) -> dict:
                 "reason":   reason,
                 "preview":  text[:120],
             })
-            return {"risk": HIGH, "reason": reason, "blocked": True}
+            return {"risk": HIGH, "reason": reason, "category": category, "blocked": True}
 
     for pattern, category in _MEDIUM_RISK_PATTERNS:
         if re.search(pattern, lower):
@@ -127,7 +127,7 @@ def inspect_prompt(text: str) -> dict:
                 "reason":   reason,
                 "preview":  text[:120],
             })
-            return {"risk": MEDIUM, "reason": reason, "blocked": False}
+            return {"risk": MEDIUM, "reason": reason, "category": category, "blocked": False}
 
     _log({
         "action":   "inspect_prompt",
@@ -135,7 +135,7 @@ def inspect_prompt(text: str) -> dict:
         "reason":   "No threats detected",
         "preview":  text[:120],
     })
-    return {"risk": LOW, "reason": "No threats detected", "blocked": False}
+    return {"risk": LOW, "reason": "No threats detected", "category": "none", "blocked": False}
 
 
 def classify_risk(action: str) -> str:

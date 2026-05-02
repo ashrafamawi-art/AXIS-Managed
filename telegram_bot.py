@@ -67,7 +67,7 @@ def _call_axis_api(text: str) -> str:
     resp = http_lib.post(AXIS_API_URL, json={"task": text}, timeout=120)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("answer") or "(no response)"
+    return data.get("answer") or data.get("message") or "(no response)"
 
 
 async def _ask_axis(text: str) -> str:
