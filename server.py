@@ -400,6 +400,65 @@ def cal_diag():
     return out
 
 
+@app.get("/voice/diag")
+def voice_diag():
+    """
+    Safe voice subsystem diagnostic.
+    Returns only non-secret status flags — never exposes key values.
+    """
+    import subprocess as _sp
+    import sys as _sys
+
+    # ffmpeg availability
+    try:
+        ffmpeg_path = ""
+        for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]:
+            if Path(candidate).exists():
+                ffmpeg_path = candidate
+                break
+        if not ffmpeg_path:
+            try:
+                import imageio_ffmpeg as _iff
+                ffmpeg_path = _iff.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_path = "ffmpeg"
+        _sp.run([ffmpeg_path, "-version"], capture_output=True, timeout=5, check=True)
+        ffmpeg_ok = True
+    except Exception:
+        ffmpeg_ok = False
+
+    # active backend
+    dg_key_present = bool(os.environ.get("DEEPGRAM_API_KEY", "").strip())
+    active_backend = "deepgram+whisper_fallback" if dg_key_present else "whisper_only"
+
+    # commit / version
+    try:
+        commit = _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or "unknown"
+    except Exception:
+        commit = "unknown"
+
+    return {
+        "deepgram_key_present":            dg_key_present,
+        "voice_postprocess_with_claude":   os.environ.get("VOICE_POSTPROCESS_WITH_CLAUDE", "false"),
+        "ffmpeg_available":                ffmpeg_ok,
+        "python_version":                  _sys.version.split()[0],
+        "active_voice_backend":            active_backend,
+        "whisper_model":                   os.environ.get("WHISPER_MODEL", "small"),
+        "timeout_voice_handler_s":         int(os.environ.get("VOICE_HANDLER_TIMEOUT", 60)),
+        "timeout_deepgram_s":              int(os.environ.get("DEEPGRAM_TIMEOUT", 20)),
+        "timeout_whisper_s":               int(os.environ.get("WHISPER_TIMEOUT", 30)),
+        "app_commit":                      commit,
+        "note": (
+            "DEEPGRAM_API_KEY must be set in Render env vars for fast Arabic transcription. "
+            "Without it, Whisper cold-load takes 40+ seconds and will hit the 30 s timeout."
+            if not dg_key_present else "Deepgram configured — fast path active."
+        ),
+    }
+
+
 @app.post("/task")
 async def post_task(req: TaskRequest):
     task = req.task.strip()

@@ -80,3 +80,8 @@ services:
         value: https://axis-api.onrender.com/task
       - key: WHISPER_MODEL
         value: small                 # tiny|base|small|medium — large-v3 needs >512MB RAM
+      - key: DEEPGRAM_API_KEY
+        sync: false                  # REQUIRED for fast Arabic voice — set in Render dashboard
+                                     # without it the bot falls back to local Whisper (40+ s cold load)
+      - key: VOICE_POSTPROCESS_WITH_CLAUDE
+        value: "false"               # set to "true" to enable Claude Haiku post-correction
