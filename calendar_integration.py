@@ -2,14 +2,29 @@
 AXIS Google Calendar Integration.
 
 Provides CalendarService — read, create, update, delete events.
-Scope: calendar.events (events only, not calendar settings).
 Security: token contents are never logged or printed.
+
+If you get a 403 error, one of these is the cause:
+  1. Google Calendar API is not enabled in your GCP project.
+     Fix: https://console.cloud.google.com/apis/library/calendar-json.googleapis.com
+  2. The stored token was authorized with narrower scopes than GCAL_SCOPES.
+     Fix: run  python3 check_calendar.py --reauth
+  3. The token has been revoked or expired with no refresh token.
+     Fix: run  python3 check_calendar.py --reauth
 """
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+# Full access + explicit readonly — ensures the consent screen requests both.
+# If the old token only had calendar.events, a --reauth run is required.
+GCAL_SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.readonly",
+]
+
+# Keep the old single-scope name as an alias so other modules don't break.
+GCAL_SCOPE = GCAL_SCOPES[0]
 
 
 class CalendarService:
@@ -26,6 +41,7 @@ class CalendarService:
     def _get_creds(self):
         if self._creds is not None:
             if self._creds.valid:
+                _check_token_scopes(self._creds)
                 return self._creds
             if self._creds.expired and self._creds.refresh_token:
                 from google.auth.transport.requests import Request
@@ -34,13 +50,14 @@ class CalendarService:
 
         # Fallback: load from token.pickle (local dev only)
         if self._token_file is None or not self._token_file.exists():
-            raise FileNotFoundError(
-                "Google Calendar credentials not available. "
-                "Ask AXIS to authorize Google Calendar first."
+            raise PermissionError(
+                "Google Calendar token not found.\n"
+                "Run:  python3 check_calendar.py --reauth"
             )
         import pickle
         with self._token_file.open("rb") as f:
             creds = pickle.load(f)
+        _check_token_scopes(creds)
         if creds.expired and creds.refresh_token:
             from google.auth.transport.requests import Request
             creds.refresh(Request())
@@ -52,6 +69,33 @@ class CalendarService:
     def _svc(self):
         from googleapiclient.discovery import build
         return build("calendar", "v3", credentials=self._get_creds(), cache_discovery=False)
+
+    # ------------------------------------------------------------------
+    # Auth check
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def check_auth(cls, token_file: Path = None, creds=None) -> dict:
+        """
+        Verify that Google Calendar credentials are valid and have the
+        required scopes.  Returns a status dict:
+          { "ok": bool, "scopes": list, "error": str|None }
+        Does NOT raise — safe to call from health-check endpoints.
+        """
+        try:
+            svc = cls(token_file=token_file, creds=creds)
+            c   = svc._get_creds()
+            token_scopes = list(getattr(c, "scopes", None) or [])
+            # Use events.list — works with calendar.events scope and above.
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            svc._svc().events().list(
+                calendarId="primary", timeMin=now, maxResults=1, singleEvents=True,
+            ).execute()
+            return {"ok": True, "scopes": token_scopes, "error": None}
+        except Exception as exc:
+            msg = _interpret_error(exc)
+            return {"ok": False, "scopes": [], "error": msg}
 
     # ------------------------------------------------------------------
     # Read
@@ -181,3 +225,47 @@ def _tz_name(dt: datetime) -> str:
         return str(dt.tzinfo)
     except Exception:
         return "UTC"
+
+
+def _check_token_scopes(creds) -> None:
+    """Raise PermissionError if the token is missing all Calendar scopes."""
+    token_scopes = set(getattr(creds, "scopes", None) or [])
+    if not token_scopes:
+        return  # scopes not embedded in this token type — skip check
+    # Any of these scopes is sufficient for reading and writing events.
+    sufficient = {
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/calendar.events",
+    }
+    if not token_scopes.intersection(sufficient):
+        raise PermissionError(
+            f"Google Calendar token has insufficient scopes.\n"
+            f"  Token has : {token_scopes}\n"
+            f"  Need any of: {sufficient}\n"
+            "Fix: python3 check_calendar.py --reauth"
+        )
+
+
+def _interpret_error(exc: Exception) -> str:
+    """Turn a Google API exception into a human-readable diagnosis."""
+    msg = str(exc)
+    # googleapiclient.errors.HttpError carries status in the message
+    if "403" in msg or "forbidden" in msg.lower():
+        return (
+            "403 Forbidden — two possible causes:\n"
+            "  1. Google Calendar API not enabled in your GCP project.\n"
+            "     Enable it: https://console.cloud.google.com/apis/library/calendar-json.googleapis.com\n"
+            "  2. Token was authorized with insufficient scopes.\n"
+            "     Fix: python3 check_calendar.py --reauth"
+        )
+    if "401" in msg or "unauthorized" in msg.lower() or "invalid_grant" in msg.lower():
+        return (
+            "401 Unauthorized — token expired or revoked.\n"
+            "Fix: python3 check_calendar.py --reauth"
+        )
+    if "token not found" in msg.lower() or "not available" in msg.lower():
+        return (
+            "No Google Calendar token found.\n"
+            "Fix: python3 check_calendar.py --reauth"
+        )
+    return msg

@@ -19,6 +19,7 @@ import anthropic
 
 import memory_supabase as _mem
 import task_manager as _tm
+from calendar_integration import GCAL_SCOPES
 
 # Asia/Riyadh = UTC+3, no DST
 _RIYADH_OFFSET = timedelta(hours=3)
@@ -80,7 +81,7 @@ def _load_gcal_creds():
             from google.oauth2.credentials import Credentials
             creds = Credentials.from_authorized_user_info(
                 json.loads(token_json),
-                ["https://www.googleapis.com/auth/calendar.events"],
+                GCAL_SCOPES,
             )
             if not creds.valid and creds.expired and creds.refresh_token:
                 creds.refresh(Request())

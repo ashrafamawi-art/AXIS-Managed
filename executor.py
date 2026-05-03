@@ -43,6 +43,7 @@ _gcal_creds_cache = None
 def _load_gcal_creds():
     """Load Google Calendar creds: GOOGLE_TOKEN_JSON (cloud) → token.pickle (local dev)."""
     global _gcal_creds_cache
+    from calendar_integration import GCAL_SCOPES, _check_token_scopes, _interpret_error
     try:
         from google.auth.transport.requests import Request
 
@@ -56,10 +57,10 @@ def _load_gcal_creds():
         token_json = os.environ.get("GOOGLE_TOKEN_JSON", "")
         if token_json:
             from google.oauth2.credentials import Credentials
-            scopes = ["https://www.googleapis.com/auth/calendar.events"]
-            creds  = Credentials.from_authorized_user_info(json.loads(token_json), scopes)
+            creds = Credentials.from_authorized_user_info(json.loads(token_json), GCAL_SCOPES)
             if not creds.valid and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
+            _check_token_scopes(creds)
             _gcal_creds_cache = creds
             return creds
 
@@ -67,6 +68,7 @@ def _load_gcal_creds():
             import pickle
             with _TOKEN_FILE.open("rb") as f:
                 creds = pickle.load(f)
+            _check_token_scopes(creds)
             if creds.valid:
                 _gcal_creds_cache = creds
                 return creds
@@ -76,8 +78,12 @@ def _load_gcal_creds():
                     pickle.dump(creds, f)
                 _gcal_creds_cache = creds
                 return creds
-    except Exception:
-        pass
+    except (PermissionError, ValueError) as exc:
+        # Scope or token issues — surface them instead of silently returning None
+        print(f"[executor] Calendar auth error: {exc}")
+        raise
+    except Exception as exc:
+        print(f"[executor] Calendar credentials unavailable: {_interpret_error(exc)}")
     return None
 
 # ---------------------------------------------------------------------------
@@ -156,16 +162,14 @@ def _create_calendar_event(
     try:
         creds = _load_gcal_creds()
         if creds is None:
-            _save_task(
-                task=f"[PENDING CALENDAR] {title} — {start_iso}",
-                priority="high",
-            )
+            _save_task(task=f"[PENDING CALENDAR] {title} — {start_iso}", priority="high")
             return (
-                "Google Calendar credentials are not configured on Render. "
-                "Task saved as pending."
+                "⚠️ Google Calendar token not found or invalid.\n"
+                "Fix: run  python3 check_calendar.py --reauth\n"
+                "Event saved as a pending task."
             )
 
-        from calendar_integration import CalendarService
+        from calendar_integration import CalendarService, _interpret_error
 
         start_dt = datetime.fromisoformat(start_iso)
         end_dt   = datetime.fromisoformat(end_iso) if end_iso else start_dt + timedelta(hours=1)
@@ -177,19 +181,18 @@ def _create_calendar_event(
             names = [c.get("summary", "Untitled") for c in conflicts[:2]]
             conflict_note = f" ⚠️ Conflict with: {', '.join(names)}"
 
-        event    = cal.create_event(title, start_dt, end_dt, description, location)
+        cal.create_event(title, start_dt, end_dt, description, location)
         fmt_time = start_dt.strftime("%a %b %-d at %-I:%M %p")
         return f"CALENDAR_EVENT_CREATED: '{title}' on {fmt_time}{conflict_note}"
 
+    except (PermissionError, ValueError) as exc:
+        # Scope / token problem — don't save as pending, surface the fix
+        return f"❌ Calendar auth error: {exc}"
+
     except Exception as exc:
-        try:
-            _save_task(
-                task=f"[PENDING CALENDAR] {title} — {start_iso}",
-                priority="high",
-            )
-        except Exception:
-            pass
-        return f"Calendar execution failed, task saved as pending. Error: {exc}"
+        diagnosis = _interpret_error(exc) if "calendar_integration" in dir() else str(exc)
+        _save_task(task=f"[PENDING CALENDAR] {title} — {start_iso}", priority="high")
+        return f"❌ Calendar error: {diagnosis}\nEvent saved as pending task."
 
 
 _DISPATCH = {
