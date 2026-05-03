@@ -65,7 +65,7 @@ VOICE_POSTPROCESS_WITH_CLAUDE = (
 )
 
 # Hard timeouts — never leave the user stuck
-_VOICE_HANDLER_TIMEOUT: int = 60   # total budget for handle_voice
+_VOICE_HANDLER_TIMEOUT: int = 120  # total budget for handle_voice (background — not racing Telegram)
 _DEEPGRAM_TIMEOUT:      int = 20   # Deepgram API call
 _WHISPER_TIMEOUT:       int = 30   # Whisper model load + transcription
 _AXIS_TIMEOUT:          int = 60   # AXIS API call from voice handler
@@ -477,23 +477,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid        = update.effective_user.id
-    # update_id is unique per Telegram message and stable across retries
     request_id = f"tg-{update.update_id}"
     print(f"[{_ts()}] [AXIS Telegram] text uid={uid} update_id={update.update_id}: {text[:80]!r}")
 
     thinking = await update.message.reply_text("⏳")
-    try:
-        response = await _ask_axis(text, request_id=request_id)
-        if len(response) > 4000:
-            response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
-        await thinking.edit_text(response)
-    except Exception as exc:
-        print(f"[{_ts()}] [AXIS Telegram] ERROR calling AXIS API: {exc}")
-        await thinking.edit_text(
-            f"⚠️ AXIS API error: {exc}\n\n"
-            f"API URL: {AXIS_API_URL}\n"
-            "Use /status to check connectivity."
-        )
+
+    async def _run():
+        try:
+            response = await _ask_axis(text, request_id=request_id)
+            if len(response) > 4000:
+                response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
+            await thinking.edit_text(response)
+        except Exception as exc:
+            print(f"[{_ts()}] [AXIS Telegram] ERROR calling AXIS API: {exc}")
+            await thinking.edit_text(
+                f"⚠️ AXIS API error: {exc}\n\n"
+                f"API URL: {AXIS_API_URL}\n"
+                "Use /status to check connectivity."
+            )
+
+    asyncio.create_task(_run())
 
 
 async def _voice_inner(
@@ -573,23 +576,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     status = await update.message.reply_text("🎙 Transcribing...")
 
-    try:
-        await asyncio.wait_for(
-            _voice_inner(update, context, status, uid, request_id),
-            timeout=_VOICE_HANDLER_TIMEOUT,
-        )
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        _vlog(f"voice_handler_timeout after={_VOICE_HANDLER_TIMEOUT}s")
+    async def _run():
         try:
-            await status.edit_text(_FAILURE_MSG)
-        except Exception:
-            pass
-    except Exception as exc:
-        _vlog(f"voice_handler_error reason={type(exc).__name__}:{exc!s:.120}")
-        try:
-            await status.edit_text(_FAILURE_MSG)
-        except Exception:
-            pass
+            await asyncio.wait_for(
+                _voice_inner(update, context, status, uid, request_id),
+                timeout=_VOICE_HANDLER_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _vlog(f"voice_handler_timeout after={_VOICE_HANDLER_TIMEOUT}s")
+            try:
+                await status.edit_text(_FAILURE_MSG)
+            except Exception:
+                pass
+        except Exception as exc:
+            _vlog(f"voice_handler_error reason={type(exc).__name__}:{exc!s:.120}")
+            try:
+                await status.edit_text(_FAILURE_MSG)
+            except Exception:
+                pass
+
+    asyncio.create_task(_run())
 
 
 # ---------------------------------------------------------------------------
