@@ -676,24 +676,39 @@ _brain = AXISBrain()
 
 
 def _brain_to_plan(brain_output: dict, task: str) -> dict:
-    """Convert brain agent instructions into a maestro DAG plan."""
-    steps = []
-    for i, agent_inst in enumerate(brain_output.get("agents", [])):
-        agent_name = agent_inst["agent"]
-        # Map 'development' (brain concept) to 'github' (maestro agent)
+    """Convert brain agent instructions into a single-step maestro plan.
+
+    The brain may return multiple agents (one per perceived sub-action).
+    However, every step receives the same full task as input, so N steps
+    trigger N independent _run_pipeline executions — each of which plans
+    and executes the entire task.  For a message containing two meetings
+    that produces two calendar-agent steps, both pipelines independently
+    extract and try to create both events, causing duplicates.
+
+    One step is always sufficient: the inner pipeline (council → AXIS
+    session → executor.plan → executor.execute) handles all actions in
+    the task, including multiple calendar events in a single message.
+    """
+    agents = brain_output.get("agents", [])
+    if agents:
+        primary    = agents[0]
+        agent_name = primary["agent"]
         if agent_name not in _AGENT_MAP:
             agent_name = "general"
-        steps.append({
-            "id":          f"s{i + 1}",
+        description = primary["action"]
+    else:
+        agent_name  = "general"
+        description = task
+    return {
+        "steps": [{
+            "id":          "s1",
             "agent":       agent_name,
-            "description": agent_inst["action"],
+            "description": description,
             "input":       task,
             "depends_on":  [],
-        })
-    if not steps:
-        steps = [{"id": "s1", "agent": "general", "description": task,
-                  "input": task, "depends_on": []}]
-    return {"steps": steps, "rationale": f"brain:{brain_output['intent']}"}
+        }],
+        "rationale": f"brain:{brain_output['intent']}",
+    }
 
 # ---------------------------------------------------------------------------
 # Orchestrator: plan → execute → synthesize

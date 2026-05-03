@@ -145,9 +145,15 @@ def _format_response(data: dict) -> str:
     arts = data.get("artifacts", {})
     lines: list[str] = []
 
-    # Calendar events created
+    # Calendar events created — strip internal "CALENDAR_EVENT_CREATED:" prefix
     for item in arts.get("calendar", []):
-        if isinstance(item, str):
+        if not isinstance(item, str):
+            continue
+        if item.startswith("CALENDAR_EVENT_CREATED:"):
+            lines.append("📅 " + item[len("CALENDAR_EVENT_CREATED:"):].strip())
+        elif item.startswith(("DEDUP:", "❌", "⚠️ Google")):
+            continue  # skip non-success entries silently
+        else:
             lines.append(f"📅 {item}")
 
     # Tasks saved

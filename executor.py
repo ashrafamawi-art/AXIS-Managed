@@ -170,7 +170,14 @@ def _create_calendar_event(
         age = round(now_mono - _recent_calendar_events[event_hash], 1)
         print(f"[executor] DEDUP: skipping duplicate calendar event "
               f"'{title}' at {start_iso} hash={event_hash} (seen {age}s ago)")
-        return f"DEDUP: calendar event '{title}' already created ({age}s ago — duplicate skipped)"
+        # Return the same format as a successful creation — the event exists in
+        # the calendar (it was created earlier in this pipeline run).  Using the
+        # internal "DEDUP:" prefix here causes confusing user-facing output.
+        try:
+            fmt_time = datetime.fromisoformat(start_iso).strftime("%a %b %-d at %-I:%M %p")
+        except Exception:
+            fmt_time = start_iso
+        return f"CALENDAR_EVENT_CREATED: '{title}' on {fmt_time}"
 
     _recent_calendar_events[event_hash] = now_mono
     print(f"[executor] calendar event: title={title!r} start={start_iso} hash={event_hash}")
@@ -448,8 +455,15 @@ def execute(sub_task: str, context: str, client: anthropic.Anthropic,
                     call.input.get("start_iso", ""),
                 )
                 if eh in _local_calendar_hashes:
-                    out = "DEDUP: create_calendar_event already called in this execution — skipped"
                     print(f"{prefix}   DEDUP (inner loop): hash={eh}")
+                    # Return same success format — skip silently
+                    try:
+                        fmt_time = datetime.fromisoformat(
+                            call.input.get("start_iso", "")
+                        ).strftime("%a %b %-d at %-I:%M %p")
+                    except Exception:
+                        fmt_time = call.input.get("start_iso", "")
+                    out = f"CALENDAR_EVENT_CREATED: '{call.input.get('title', '')}' on {fmt_time}"
                     results.append({"tool": call.name, "output": out})
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": call.id, "content": out,

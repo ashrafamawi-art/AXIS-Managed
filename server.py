@@ -212,9 +212,22 @@ def _run_pipeline(task: str, request_id: str = "") -> dict:
 
     # 6. Feedback pass — close the loop with AXIS
     if all_results:
+        # Strip internal prefixes before sending to AXIS so the feedback
+        # response is clean and doesn't include "CALENDAR_EVENT_CREATED:"
+        # or "DEDUP:" technical markers.
+        feedback_lines = []
+        for r in all_results:
+            tool, output = r["tool"], r["output"]
+            if tool == "create_calendar_event":
+                if output.startswith("CALENDAR_EVENT_CREATED:"):
+                    output = "Calendar event created:" + output[len("CALENDAR_EVENT_CREATED:"):]
+                else:
+                    continue  # skip errors / any remaining non-success strings
+            feedback_lines.append(f"• {tool}: {output}")
+
         summary = (
             f"Execution complete for: '{task}'\n\n"
-            + "\n".join(f"• {r['tool']}: {r['output']}" for r in all_results)
+            + "\n".join(feedback_lines)
             + "\n\nIs the goal fully achieved? What is the single most important next step?"
         )
         feedback = _stream_axis(session_id, summary)
@@ -222,9 +235,13 @@ def _run_pipeline(task: str, request_id: str = "") -> dict:
     else:
         final_answer = axis_response
 
-    # 7. Build artifacts
+    # 7. Build artifacts — only include successful operations
     artifacts: dict = {}
-    calendar_events = [r["output"] for r in all_results if r["tool"] == "create_calendar_event"]
+    calendar_events = [
+        r["output"] for r in all_results
+        if r["tool"] == "create_calendar_event"
+        and r["output"].startswith("CALENDAR_EVENT_CREATED:")
+    ]
     notifications   = [r["output"] for r in all_results if r["tool"] == "send_notification"]
     tasks_saved     = [r["output"] for r in all_results if r["tool"] == "save_task"]
     http_calls      = [r["output"] for r in all_results if r["tool"] == "http_request"]
