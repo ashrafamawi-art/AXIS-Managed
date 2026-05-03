@@ -11,7 +11,6 @@ Sections:
 
 import json
 import os
-import pickle
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -65,6 +64,7 @@ _gcal_creds_cache = None
 
 
 def _load_gcal_creds():
+    """Load Google Calendar creds exclusively from GOOGLE_TOKEN_JSON env var."""
     global _gcal_creds_cache
     try:
         from google.auth.transport.requests import Request
@@ -77,26 +77,16 @@ def _load_gcal_creds():
                 return _gcal_creds_cache
 
         token_json = os.environ.get("GOOGLE_TOKEN_JSON", "")
-        if token_json:
-            from google.oauth2.credentials import Credentials
-            creds = Credentials.from_authorized_user_info(
-                json.loads(token_json),
-                GCAL_SCOPES,
-            )
-            if not creds.valid and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            _gcal_creds_cache = creds
-            return creds
+        if not token_json:
+            print("[briefing] GOOGLE_TOKEN_JSON not set — skipping calendar")
+            return None
 
-        token_file = Path("token.pickle")
-        if token_file.exists():
-            with token_file.open("rb") as f:
-                creds = pickle.load(f)
-            if creds.expired and creds.refresh_token:
-                from google.auth.transport.requests import Request as _Req
-                creds.refresh(_Req())
-            _gcal_creds_cache = creds
-            return creds
+        from google.oauth2.credentials import Credentials
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), GCAL_SCOPES)
+        if not creds.valid and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        _gcal_creds_cache = creds
+        return creds
     except Exception as exc:
         print(f"[briefing] gcal creds error: {exc}")
     return None

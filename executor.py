@@ -18,7 +18,6 @@ import requests as http_lib
 _MODEL      = "claude-sonnet-4-6"
 _DATA_DIR   = Path(os.environ.get("AXIS_DATA_DIR", str(Path(__file__).parent)))
 _TASKS_FILE = _DATA_DIR / "tasks.md"
-_TOKEN_FILE = _DATA_DIR / "token.pickle"
 
 # ---------------------------------------------------------------------------
 # Calendar dedup — prevents the same event being created more than once
@@ -41,7 +40,8 @@ _gcal_creds_cache = None
 
 
 def _load_gcal_creds():
-    """Load Google Calendar creds: GOOGLE_TOKEN_JSON (cloud) → token.pickle (local dev)."""
+    """Load Google Calendar creds exclusively from GOOGLE_TOKEN_JSON env var.
+    Identical auth path to /cal/diag — no token.pickle, no manual headers."""
     global _gcal_creds_cache
     from calendar_integration import GCAL_SCOPES, _check_token_scopes, _interpret_error
     try:
@@ -55,31 +55,19 @@ def _load_gcal_creds():
                 return _gcal_creds_cache
 
         token_json = os.environ.get("GOOGLE_TOKEN_JSON", "")
-        if token_json:
-            from google.oauth2.credentials import Credentials
-            creds = Credentials.from_authorized_user_info(json.loads(token_json), GCAL_SCOPES)
-            if not creds.valid and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            _check_token_scopes(creds)
-            _gcal_creds_cache = creds
-            return creds
+        if not token_json:
+            print("[executor] GOOGLE_TOKEN_JSON not set — calendar unavailable")
+            return None
 
-        if _TOKEN_FILE.exists():
-            import pickle
-            with _TOKEN_FILE.open("rb") as f:
-                creds = pickle.load(f)
-            _check_token_scopes(creds)
-            if creds.valid:
-                _gcal_creds_cache = creds
-                return creds
-            if creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                with _TOKEN_FILE.open("wb") as f:
-                    pickle.dump(creds, f)
-                _gcal_creds_cache = creds
-                return creds
+        from google.oauth2.credentials import Credentials
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), GCAL_SCOPES)
+        if not creds.valid and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        _check_token_scopes(creds)
+        _gcal_creds_cache = creds
+        return creds
+
     except (PermissionError, ValueError) as exc:
-        # Scope or token issues — surface them instead of silently returning None
         print(f"[executor] Calendar auth error: {exc}")
         raise
     except Exception as exc:
@@ -121,6 +109,13 @@ def _save_task(task: str = "", priority: str = "medium", due: str = "", **extra)
 
 def _http_request(url: str, method: str = "GET",
                   headers: dict = None, body: str = None, **_) -> str:
+    # Google Calendar must go through the authenticated tools, not raw HTTP.
+    if "googleapis.com/calendar" in url:
+        return (
+            "Error: direct HTTP to googleapis.com/calendar is blocked. "
+            "Use 'get_calendar_events' to read events or "
+            "'create_calendar_event' to write events."
+        )
     try:
         kwargs: dict = {"headers": headers or {}, "timeout": 15}
         if body:
@@ -129,6 +124,27 @@ def _http_request(url: str, method: str = "GET",
         return f"HTTP {r.status_code} ← {url}"
     except Exception as exc:
         return f"Error: {exc}"
+
+
+def _get_calendar_events(days: int = 7, **_) -> str:
+    """Read upcoming events using the same authenticated client as /cal/diag."""
+    try:
+        creds = _load_gcal_creds()
+        if creds is None:
+            return (
+                "⚠️ Google Calendar credentials not available. "
+                "Ensure GOOGLE_TOKEN_JSON is set on Render."
+            )
+        from calendar_integration import CalendarService, _interpret_error
+        events = CalendarService(creds=creds).get_upcoming_events(days=min(days, 30))
+        if not events:
+            return f"No events in the next {days} days."
+        return CalendarService.fmt_events(events, f"📅 Next {days} days:")
+    except (PermissionError, ValueError) as exc:
+        return f"❌ Calendar auth error: {exc}"
+    except Exception as exc:
+        from calendar_integration import _interpret_error
+        return f"❌ Calendar error: {_interpret_error(exc)}"
 
 
 def _create_calendar_event(
@@ -197,12 +213,32 @@ def _create_calendar_event(
 
 _DISPATCH = {
     "create_calendar_event": _create_calendar_event,
+    "get_calendar_events":   _get_calendar_events,
     "send_notification":     _send_notification,
     "save_task":             _save_task,
     "http_request":          _http_request,
 }
 
 TOOLS = [
+    {
+        "name": "get_calendar_events",
+        "description": (
+            "Read upcoming Google Calendar events. Use this to check availability, "
+            "list scheduled meetings, or verify that an event exists. "
+            "This is the ONLY correct way to read calendar data — "
+            "never use http_request for googleapis.com/calendar."
+        ),
+        "input_schema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "How many days ahead to fetch (default 7, max 30).",
+                },
+            },
+            "required": [],
+        },
+    },
     {
         "name": "create_calendar_event",
         "description": (
@@ -277,7 +313,11 @@ TOOLS = [
     },
     {
         "name": "http_request",
-        "description": "Make an HTTP request. Only use when a specific URL is present.",
+        "description": (
+            "Make an HTTP request to an external URL. "
+            "Never use for googleapis.com/calendar — "
+            "use get_calendar_events or create_calendar_event instead."
+        ),
         "input_schema": {
             "type": "object", "additionalProperties": False,
             "properties": {
