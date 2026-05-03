@@ -10,6 +10,9 @@ import os
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+_DUBAI_TZ = ZoneInfo("Asia/Dubai")
 from pathlib import Path
 
 import anthropic
@@ -217,7 +220,15 @@ def _create_calendar_event(
         from calendar_integration import CalendarService, _interpret_error
 
         start_dt = datetime.fromisoformat(start_iso)
-        end_dt   = datetime.fromisoformat(end_iso) if end_iso else start_dt + timedelta(hours=1)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=_DUBAI_TZ)
+
+        end_dt = datetime.fromisoformat(end_iso) if end_iso else start_dt + timedelta(hours=1)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=_DUBAI_TZ)
+
+        print(f"[executor] calendar create: '{title}' "
+              f"start={start_dt.isoformat()} end={end_dt.isoformat()} tz=Asia/Dubai")
 
         cal       = CalendarService(creds=creds)
         conflicts = cal.check_conflicts(start_dt, end_dt)
@@ -428,12 +439,16 @@ def plan(task: str, axis_response: str, memory_ctx: str,
 # ---------------------------------------------------------------------------
 
 def _exec_system() -> str:
-    now = datetime.now()
+    now = datetime.now(_DUBAI_TZ)
     return (
-        f"You are the AXIS Execution Engine. Today is {now.strftime('%A, %B %-d, %Y')} "
-        f"(local time {now.strftime('%-I:%M %p')}).\n"
+        f"You are the AXIS Execution Engine. "
+        f"Current date and time in Abu Dhabi (Asia/Dubai, UTC+4): "
+        f"{now.strftime('%A, %B %-d, %Y at %-I:%M %p')}.\n"
         "Act on the sub-task autonomously using available tools. "
         "Be specific — extract names, times, and context from the task.\n\n"
+        "TIMEZONE RULE: All times are in Abu Dhabi timezone (Asia/Dubai, UTC+4). "
+        "Generate start_iso and end_iso as bare local time strings with NO timezone suffix, "
+        "e.g. '2026-05-06T15:00:00' — the system attaches Asia/Dubai automatically.\n\n"
         "CALENDAR EVENT QUALITY RULES — follow these exactly:\n"
         "- title: Extract the person's name and purpose. Examples:\n"
         "    'Add meeting with Bassam tomorrow at 3pm'  → 'Meeting with Bassam'\n"
@@ -444,7 +459,7 @@ def _exec_system() -> str:
         "- end_iso: Default to 1 hour after start if not specified.\n"
         "- description: Always set to 'Scheduled via AXIS: <exact original user message>'.\n"
         "- location: Use 'TBD' when no location is mentioned.\n\n"
-        "Resolve relative dates (today, tomorrow, next Monday) using today's date above.\n"
+        "Resolve relative dates (today, tomorrow, next Monday) using the Abu Dhabi date above.\n"
         "If no real-world action is warranted, call no tools."
     )
 

@@ -15,6 +15,10 @@ If you get a 403 error, one of these is the cause:
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_DUBAI_TZ      = ZoneInfo("Asia/Dubai")
+_DUBAI_TZ_NAME = "Asia/Dubai"
 
 # Full access + explicit readonly — ensures the consent screen requests both.
 # If the old token only had calendar.events, a --reauth run is required.
@@ -150,11 +154,10 @@ class CalendarService:
         """Create a calendar event. Returns the created event resource."""
         start = _ensure_tz(start)
         end   = _ensure_tz(end)
-        tz    = _tz_name(start)
         body: dict = {
             "summary": title,
-            "start":   {"dateTime": start.isoformat(), "timeZone": tz},
-            "end":     {"dateTime": end.isoformat(),   "timeZone": tz},
+            "start":   {"dateTime": start.isoformat(), "timeZone": _DUBAI_TZ_NAME},
+            "end":     {"dateTime": end.isoformat(),   "timeZone": _DUBAI_TZ_NAME},
         }
         if description:
             body["description"] = description
@@ -215,16 +218,10 @@ class CalendarService:
 # ------------------------------------------------------------------
 
 def _ensure_tz(dt: datetime) -> datetime:
+    """Attach Asia/Dubai timezone to naive datetimes. Never uses system default."""
     if dt.tzinfo is None:
-        return dt.astimezone()
+        return dt.replace(tzinfo=_DUBAI_TZ)
     return dt
-
-
-def _tz_name(dt: datetime) -> str:
-    try:
-        return str(dt.tzinfo)
-    except Exception:
-        return "UTC"
 
 
 def _check_token_scopes(creds) -> None:
