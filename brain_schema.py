@@ -1,7 +1,7 @@
 """AXIS Brain — Pydantic schema for structured brain output."""
 
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -62,11 +62,11 @@ class FinalResponseStrategy(str, Enum):
 
 
 class AgentInstruction(BaseModel):
-    agent:             AgentName
-    role:              AgentRole
+    agent:              AgentName
+    role:               AgentRole
     intelligence_level: IntelligenceLevel
-    action:            str
-    input:             dict[str, Any] = Field(default_factory=dict)
+    action:             str
+    input:              Optional[dict[str, Any]] = Field(default_factory=dict)
 
 
 class BrainOutput(BaseModel):

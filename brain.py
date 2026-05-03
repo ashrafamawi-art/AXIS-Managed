@@ -10,6 +10,7 @@ Usage:
 """
 
 import json
+import os
 
 import anthropic
 
@@ -17,7 +18,8 @@ from brain_schema import BrainOutput
 
 _MODEL = "claude-sonnet-4-6"
 
-# JSON Schema enforced by the API — mirrors BrainOutput exactly.
+# Claude's json_schema format requires additionalProperties: false on every object.
+# The `input` field is omitted here (open dict) — callers build it after classification.
 _BRAIN_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -33,14 +35,11 @@ _BRAIN_SCHEMA = {
             "type": "string",
             "enum": ["SIMPLE_EXECUTION", "ASSISTED_EXECUTION", "COMPLEX_PLANNING", "SELF_IMPROVEMENT"],
         },
-        "needs_planning":       {"type": "boolean"},
-        "needs_research":       {"type": "boolean"},
-        "needs_axis_review":    {"type": "boolean"},
-        "confidence":           {"type": "number"},
-        "risk": {
-            "type": "string",
-            "enum": ["low", "medium", "high"],
-        },
+        "needs_planning":        {"type": "boolean"},
+        "needs_research":        {"type": "boolean"},
+        "needs_axis_review":     {"type": "boolean"},
+        "confidence":            {"type": "number"},
+        "risk":                  {"type": "string", "enum": ["low", "medium", "high"]},
         "requires_confirmation": {"type": "boolean"},
         "agents": {
             "type": "array",
@@ -55,9 +54,8 @@ _BRAIN_SCHEMA = {
                     "role":              {"type": "string", "enum": ["execute", "analyze", "plan", "review"]},
                     "intelligence_level": {"type": "string", "enum": ["low", "medium", "high"]},
                     "action":            {"type": "string"},
-                    "input":             {"type": "object"},
                 },
-                "required": ["agent", "role", "intelligence_level", "action", "input"],
+                "required": ["agent", "role", "intelligence_level", "action"],
             },
         },
         "final_response_strategy": {
@@ -96,12 +94,16 @@ _SYSTEM_PROMPT = """\
 SIMPLE_EXECUTION:
   - أمر واضح، أداة واحدة، غموض منخفض
   - needs_axis_review: false, needs_planning: false
-  - أمثلة: إنشاء حدث تقويم، حفظ مهمة، قراءة الذاكرة، الإجابة على سؤال مباشر
+  - أمثلة: إنشاء حدث تقويم، حفظ مهمة، قراءة الذاكرة، الإجابة على سؤال تعريفي مباشر ("ما هو X؟")
+  - لا ينطبق على: مشاركة أفكار، تحليل استراتيجي، أو جمل تبدأ بـ "أفكر في / نفكر في"
 
 ASSISTED_EXECUTION:
-  - هدف واضح، يحتاج تفسير خفيف، وكيل متخصص واحد
+  - هدف واضح، يحتاج تفسير أو تحليل خفيف، وكيل متخصص واحد
   - needs_axis_review: true, needs_planning: false
   - أمثلة: صياغة رسالة، تلخيص ملاحظات، تنظيم أفكار
+  - CRITICAL — حتماً ASSISTED_EXECUTION وليس SIMPLE_EXECUTION:
+      "أفكر في X"، "نفكر في توسيع Y"، "ما رأيك في Z"، "خطر ببالي فكرة"
+      مثال: "أفكر في توسيع الشركة لسوق السعودية" → ASSISTED_EXECUTION (تحليل استراتيجي، ليس سؤالاً بسيطاً)
 
 COMPLEX_PLANNING:
   - متعدد الخطوات، قد يحتاج بحث + وكلاء متعددين
@@ -151,29 +153,34 @@ SELF_IMPROVEMENT:
 """
 
 
+def _load_api_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    key_file = os.path.expanduser("~/.anthropic_key")
+    try:
+        return open(key_file).read().strip()
+    except OSError:
+        raise RuntimeError("ANTHROPIC_API_KEY not set and ~/.anthropic_key not found.")
+
+
 class AXISBrain:
     def __init__(self) -> None:
-        self._client = anthropic.Anthropic()
+        self._client = anthropic.Anthropic(api_key=_load_api_key())
 
     def classify(self, user_input: str) -> dict:
-        """
-        Classify user input and return a validated brain output dict.
-        Falls back to a safe default on any error.
-        """
-        try:
-            resp = self._client.messages.create(
-                model=_MODEL,
-                max_tokens=1024,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_input}],
-                output_config={"format": {"type": "json_schema", "schema": _BRAIN_SCHEMA}},
-            )
-            raw = json.loads(resp.content[0].text)
-            validated = BrainOutput(**raw)
-            return validated.model_dump()
-        except Exception as exc:
-            print(f"[brain] classify error: {exc} — using fallback")
-            return _fallback(user_input)
+        """Classify user input and return a validated brain output dict."""
+        resp = self._client.messages.create(
+            model=_MODEL,
+            max_tokens=1024,
+            temperature=0,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_input}],
+            output_config={"format": {"type": "json_schema", "schema": _BRAIN_SCHEMA}},
+        )
+        raw = json.loads(resp.content[0].text)
+        validated = BrainOutput(**raw)
+        return validated.model_dump()
 
 
 def _fallback(user_input: str) -> dict:
