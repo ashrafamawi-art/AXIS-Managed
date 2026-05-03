@@ -296,11 +296,22 @@ def cancel_task(task_id: str):
 @app.get("/cal/diag")
 def cal_diag():
     """
-    Safe Google Calendar auth diagnostic. Never exposes token, refresh_token, or client_secret.
-    Checks: token source → parse → scopes → expiry → refresh → live API call.
+    Safe Google Calendar auth diagnostic.
+    Outputs only: token_source, fields_present, client_id_prefix, scopes,
+    expired, refresh_possible, calendar_test, calendar_diagnosis.
+    Never exposes token, refresh_token, client_secret, or raw exception text.
     """
     import json as _json
+    import re
     from datetime import datetime, timezone
+
+    # Redact any string that looks like a token or secret (40+ contiguous
+    # base64/URL-safe characters) before it can appear in error output.
+    _REDACT = re.compile(r'[A-Za-z0-9+/=_\-]{40,}')
+
+    def _safe_err(exc: Exception) -> str:
+        sanitised = _REDACT.sub("[redacted]", str(exc))
+        return f"{type(exc).__name__}: {sanitised[:120]}"
 
     out: dict = {}
 
@@ -309,31 +320,35 @@ def cal_diag():
     token_pickle = _DATA_DIR / "token.pickle"
 
     if token_json:
-        out["token_source"] = "env:GOOGLE_TOKEN_JSON"
+        out["token_source"] = "env"
     elif token_pickle.exists():
-        out["token_source"] = f"file:{token_pickle}"
+        out["token_source"] = "file"
     else:
-        out["token_source"] = "missing"
-        out["error"] = "No token found. Set GOOGLE_TOKEN_JSON on Render or provide token.pickle."
+        out["token_source"]       = "missing"
+        out["calendar_test"]      = "failed"
+        out["calendar_diagnosis"] = (
+            "No token found. Set GOOGLE_TOKEN_JSON on Render or provide token.pickle."
+        )
         return out
 
     # ── 2. Parse ──────────────────────────────────────────────────────────
-    info   = None
-    creds  = None
+    info  = None
+    creds = None
     try:
         if token_json:
             info = _json.loads(token_json)
-            out["fields_present"] = sorted(k for k in info if k not in
-                                           ("token", "refresh_token", "client_secret"))
+            _NEVER_SHOW = {"token", "refresh_token", "client_secret"}
+            out["fields_present"] = sorted(k for k in info if k not in _NEVER_SHOW)
         else:
             import pickle
             with token_pickle.open("rb") as f:
                 creds = pickle.load(f)
     except Exception as exc:
-        out["parse_error"] = str(exc)
+        out["calendar_test"]      = "failed"
+        out["calendar_diagnosis"] = f"Token parse error: {type(exc).__name__}"
         return out
 
-    # ── 3. client_id prefix (safe — never the full value) ─────────────────
+    # ── 3. client_id prefix — first 20 chars only ─────────────────────────
     raw_id = (info or {}).get("client_id", "") if info else getattr(creds, "client_id", "")
     out["client_id_prefix"] = (raw_id[:20] + "...") if len(raw_id) > 20 else raw_id
 
@@ -344,50 +359,42 @@ def cal_diag():
             from google.oauth2.credentials import Credentials
             creds = Credentials.from_authorized_user_info(info, GCAL_SCOPES)
         except Exception as exc:
-            out["credentials_load_error"] = str(exc)
+            out["scopes"]             = []
+            out["expired"]            = None
+            out["refresh_possible"]   = False
+            out["calendar_test"]      = "failed"
+            out["calendar_diagnosis"] = f"Credential load error: {_safe_err(exc)}"
             return out
 
     # ── 5. Token state ────────────────────────────────────────────────────
     out["scopes"]           = sorted(getattr(creds, "scopes", None) or [])
-    out["valid"]            = creds.valid
     out["expired"]          = creds.expired
     out["refresh_possible"] = bool(creds.refresh_token)
 
-    if creds.expiry:
-        expiry_utc = (creds.expiry.replace(tzinfo=timezone.utc)
-                      if creds.expiry.tzinfo is None else creds.expiry)
-        out["expiry_utc"]        = expiry_utc.isoformat()
-        out["expires_in_seconds"] = int((expiry_utc - datetime.now(timezone.utc)).total_seconds())
-    else:
-        out["expiry_utc"] = "unknown"
-
-    # ── 6. Refresh attempt ────────────────────────────────────────────────
+    # ── 6. Refresh if expired ─────────────────────────────────────────────
     if not creds.valid and creds.expired and creds.refresh_token:
         try:
             from google.auth.transport.requests import Request
             creds.refresh(Request())
-            out["refresh_status"] = "refreshed_ok"
         except Exception as exc:
-            out["refresh_status"] = f"failed: {exc}"
-    elif creds.valid:
-        out["refresh_status"] = "not_needed (token still valid)"
-    else:
-        out["refresh_status"] = "impossible (no refresh_token)"
+            out["calendar_test"]      = "failed"
+            out["calendar_diagnosis"] = f"Token refresh failed: {type(exc).__name__}"
+            return out
 
     # ── 7. Live Calendar API test ─────────────────────────────────────────
     try:
         from googleapiclient.discovery import build
-        svc     = build("calendar", "v3", credentials=creds, cache_discovery=False)
-        now_iso = datetime.now(timezone.utc).isoformat()
+        svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
         svc.events().list(
-            calendarId="primary", timeMin=now_iso,
-            maxResults=1, singleEvents=True,
+            calendarId="primary",
+            timeMin=datetime.now(timezone.utc).isoformat(),
+            maxResults=1,
+            singleEvents=True,
         ).execute()
-        out["calendar_test"] = "ok — events.list(primary) succeeded"
+        out["calendar_test"] = "ok"
     except Exception as exc:
         from calendar_integration import _interpret_error
         out["calendar_test"]      = "failed"
-        out["calendar_error_raw"] = str(exc)
         out["calendar_diagnosis"] = _interpret_error(exc)
 
     return out

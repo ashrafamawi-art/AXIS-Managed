@@ -247,9 +247,9 @@ def _check_token_scopes(creds) -> None:
 
 
 def _interpret_error(exc: Exception) -> str:
-    """Turn a Google API exception into a human-readable diagnosis."""
+    """Turn a Google API exception into a human-readable diagnosis. Never returns raw secrets."""
+    import re
     msg = str(exc)
-    # googleapiclient.errors.HttpError carries status in the message
     if "403" in msg or "forbidden" in msg.lower():
         return (
             "403 Forbidden — two possible causes:\n"
@@ -268,4 +268,6 @@ def _interpret_error(exc: Exception) -> str:
             "No Google Calendar token found.\n"
             "Fix: python3 check_calendar.py --reauth"
         )
-    return msg
+    # Fallback: redact any long token-like strings before returning
+    safe = re.sub(r'[A-Za-z0-9+/=_\-]{40,}', '[redacted]', msg)
+    return f"{type(exc).__name__}: {safe[:200]}"
