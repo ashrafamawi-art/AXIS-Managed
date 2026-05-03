@@ -676,11 +676,10 @@ _brain = AXISBrain()
 
 
 def _brain_to_plan(brain_output: dict, task: str) -> dict:
-    """Convert brain agent instructions into a maestro DAG plan."""
+    """Convert brain classify() agent instructions into a maestro DAG plan (fast path)."""
     steps = []
     for i, agent_inst in enumerate(brain_output.get("agents", [])):
         agent_name = agent_inst["agent"]
-        # Map 'development' (brain concept) to 'github' (maestro agent)
         if agent_name not in _AGENT_MAP:
             agent_name = "general"
         steps.append({
@@ -694,6 +693,26 @@ def _brain_to_plan(brain_output: dict, task: str) -> dict:
         steps = [{"id": "s1", "agent": "general", "description": task,
                   "input": task, "depends_on": []}]
     return {"steps": steps, "rationale": f"brain:{brain_output['intent']}"}
+
+
+def _plan_to_maestro(plan_output: dict, task: str) -> dict:
+    """Convert brain plan() execution_steps into a maestro DAG plan (complex path)."""
+    steps = []
+    for step in plan_output.get("execution_steps", []):
+        agent_name = step["agent"]
+        if agent_name not in _AGENT_MAP:
+            agent_name = "general"
+        steps.append({
+            "id":          step["step_id"],
+            "agent":       agent_name,
+            "description": step["action"],
+            "input":       step.get("input", task),
+            "depends_on":  step.get("depends_on", []),
+        })
+    if not steps:
+        steps = [{"id": "s1", "agent": "general", "description": task,
+                  "input": task, "depends_on": []}]
+    return {"steps": steps, "rationale": f"brain_plan:{plan_output['intent']}"}
 
 # ---------------------------------------------------------------------------
 # Orchestrator: plan → execute → synthesize
@@ -971,6 +990,9 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
 
     if task_complexity == "SIMPLE_EXECUTION":
         exec_plan = _brain_to_plan(brain_output, actual_task)
+    elif task_complexity in ("COMPLEX_PLANNING", "SELF_IMPROVEMENT"):
+        plan_output = _brain.plan(actual_task)
+        exec_plan = _plan_to_maestro(plan_output, actual_task)
     else:
         exec_plan = _build_plan(actual_task, client)
     t0 = time.monotonic()

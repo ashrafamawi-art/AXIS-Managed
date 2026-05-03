@@ -81,3 +81,28 @@ class BrainOutput(BaseModel):
     agents:               list[AgentInstruction]
     final_response_strategy: FinalResponseStrategy
     response:             str
+
+
+# ---------------------------------------------------------------------------
+# Plan output — returned by brain.plan() for COMPLEX_PLANNING / SELF_IMPROVEMENT
+# ---------------------------------------------------------------------------
+
+class PlanStep(BaseModel):
+    step_id:           str
+    agent:             AgentName
+    action:            str
+    input:             str
+    depends_on:        list[str] = Field(default_factory=list)
+    intelligence_level: IntelligenceLevel
+
+
+class PlanOutput(BaseModel):
+    intent:                Intent
+    task_complexity:       TaskComplexity
+    risk:                  Risk
+    requires_confirmation: bool
+    agents_to_use:         list[AgentName]
+    execution_steps:       list[PlanStep]
+    final_response_strategy: FinalResponseStrategy
+    needs_user_confirmation: bool
+    safety_notes:          str
