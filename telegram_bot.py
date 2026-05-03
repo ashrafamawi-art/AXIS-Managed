@@ -6,27 +6,35 @@ the response. Voice notes are transcribed with Deepgram Nova-3 (preferred)
 or faster-whisper (fallback when DEEPGRAM_API_KEY is not set or Deepgram fails).
 Claude post-processing is optional and off by default.
 
+Timeouts (hard limits — user always sees a response):
+  VOICE_HANDLER_TIMEOUT  60 s — total voice handler budget
+  DEEPGRAM_TIMEOUT       20 s — Deepgram API call
+  WHISPER_TIMEOUT        30 s — local Whisper transcription (inc. model load)
+  AXIS_TIMEOUT           20 s — AXIS API call for voice
+
 Environment variables:
   TELEGRAM_TOKEN              Bot token from @BotFather
   TELEGRAM_USER_ID            Authorized user's Telegram numeric ID
   ANTHROPIC_API_KEY           For optional Claude post-processing of transcription
   AXIS_API_URL                Full URL of the AXIS /task endpoint
                               Default: https://axis-api.onrender.com/task
-  DEEPGRAM_API_KEY            Deepgram API key — enables Nova-3 Arabic transcription
-                              If unset, falls back to faster-whisper
+  DEEPGRAM_API_KEY            Deepgram API key — enables Nova-3 Arabic transcription.
+                              MUST be set in Render env vars; without it the bot falls
+                              back to local Whisper which takes 40+ s to load cold.
   WHISPER_MODEL               faster-whisper model size (default: small)
                               tiny | base | small | medium | large-v3
-                              Only used when DEEPGRAM_API_KEY is not set or Deepgram fails
   VOICE_POSTPROCESS_WITH_CLAUDE  Set to "true" to enable Claude Haiku post-correction
-                              Default: false (Deepgram accuracy is sufficient)
+                              Default: false
 """
 
 import asyncio
 import os
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import anthropic
 import requests as http_lib
@@ -46,16 +54,26 @@ from telegram.ext import (
 AXIS_API_URL   = os.environ.get("AXIS_API_URL", "https://axis-api.onrender.com/task")
 AXIS_BASE_URL  = AXIS_API_URL.replace("/task", "")
 AXIS_HEALTH_URL = AXIS_API_URL.replace("/task", "/health")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_MODEL  = os.environ.get("WHISPER_MODEL", "small")
 
 api_key           = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_USER_ID  = os.environ.get("TELEGRAM_USER_ID", "")
 DEEPGRAM_API_KEY  = os.environ.get("DEEPGRAM_API_KEY", "").strip()
-VOICE_POSTPROCESS_WITH_CLAUDE = os.environ.get("VOICE_POSTPROCESS_WITH_CLAUDE", "false").lower() == "true"
+VOICE_POSTPROCESS_WITH_CLAUDE = (
+    os.environ.get("VOICE_POSTPROCESS_WITH_CLAUDE", "false").lower() == "true"
+)
+
+# Hard timeouts — never leave the user stuck
+_VOICE_HANDLER_TIMEOUT: int = 60   # total budget for handle_voice
+_DEEPGRAM_TIMEOUT:      int = 20   # Deepgram API call
+_WHISPER_TIMEOUT:       int = 30   # Whisper model load + transcription
+_AXIS_TIMEOUT:          int = 20   # AXIS API call from voice handler
 
 client         = anthropic.Anthropic(api_key=api_key)
 AUTHORIZED_UID = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else 0
+
+_FAILURE_MSG = "Voice transcription failed. Please resend a shorter voice message."
 
 
 def _authorized(update: Update) -> bool:
@@ -86,7 +104,7 @@ def _call_axis_api(text: str, request_id: str = "") -> dict:
     print(f"[{_ts()}] [AXIS Telegram]   request_id={request_id or '(none)'}  "
           f"task={text[:100]!r}")
 
-    resp = http_lib.post(AXIS_API_URL, json=payload, timeout=120)
+    resp = http_lib.post(AXIS_API_URL, json=payload, timeout=_AXIS_TIMEOUT)
 
     print(f"[{_ts()}] [AXIS Telegram] ← HTTP {resp.status_code} "
           f"({resp.elapsed.total_seconds():.1f}s)")
@@ -157,10 +175,17 @@ async def _ask_axis(text: str, request_id: str = "") -> str:
 
 # ---------------------------------------------------------------------------
 # Voice transcription — Deepgram Nova-3 (primary) + faster-whisper (fallback)
-# Claude post-processing is optional: VOICE_POSTPROCESS_WITH_CLAUDE=true
+#
+# IMPORTANT: WhisperModel("small") takes 40+ seconds to load cold on Render.
+# Set DEEPGRAM_API_KEY in Render env vars to use Deepgram and avoid that delay.
 # ---------------------------------------------------------------------------
 
 _whisper_model = None
+
+
+def _vlog(event: str) -> None:
+    """Structured single-line voice log. Never prints secret values."""
+    print(f"[{_ts()}] [voice] {event}", flush=True)
 
 
 def _find_ffmpeg() -> str:
@@ -177,17 +202,26 @@ def _find_ffmpeg() -> str:
 _FFMPEG: str = _find_ffmpeg()
 
 
+def _ffmpeg_available() -> bool:
+    try:
+        subprocess.run([_FFMPEG, "-version"], capture_output=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
 def _get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
+        _vlog(f"whisper_model_load_start model={WHISPER_MODEL}")
         _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        print(f"[AXIS Telegram] Whisper {WHISPER_MODEL} model loaded")
+        _vlog(f"whisper_model_load_done model={WHISPER_MODEL}")
     return _whisper_model
 
 
 def _normalize_audio(input_path: str) -> str:
-    """Normalize volume and convert to 16 kHz mono WAV. Returns temp WAV path."""
+    """Convert to 16 kHz mono WAV with loudnorm. Returns temp WAV path."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = tmp.name
     subprocess.run(
@@ -196,16 +230,19 @@ def _normalize_audio(input_path: str) -> str:
          "-ar", "16000", "-ac", "1", wav_path],
         capture_output=True,
         check=True,
+        timeout=30,
     )
     return wav_path
 
 
 def _transcribe_deepgram(audio_path: str) -> str:
     """
-    Transcribe using Deepgram Nova-3 Arabic (SDK v6+).
-    Returns transcript string or raises on failure.
+    Blocking: Deepgram Nova-3 Arabic (SDK v6).
+    SDK-level timeout = _DEEPGRAM_TIMEOUT seconds.
+    Raises on any failure — caller handles.
     """
-    from deepgram import DeepgramClient  # lazy import — only when key is set
+    from deepgram import DeepgramClient                    # lazy import
+    from deepgram.core.request_options import RequestOptions
     dg = DeepgramClient(api_key=DEEPGRAM_API_KEY)
     with open(audio_path, "rb") as f:
         audio_bytes = f.read()
@@ -214,19 +251,24 @@ def _transcribe_deepgram(audio_path: str) -> str:
         model="nova-3",
         language="ar",
         smart_format=True,
+        request_options=RequestOptions(timeout_in_seconds=_DEEPGRAM_TIMEOUT),
     )
     transcript = response.results.channels[0].alternatives[0].transcript
     return (transcript or "").strip()
 
 
 def _transcribe_whisper(audio_path: str) -> str:
-    """Transcribe using local faster-whisper. Returns transcript string."""
+    """
+    Blocking: local faster-whisper (includes model load on first call).
+    WARNING: first call takes 40+ seconds on Render cold start.
+    """
+    _vlog("whisper_start")
     model = _get_whisper_model()
     segments, info = model.transcribe(
         audio_path, language="ar", beam_size=5, vad_filter=True,
     )
     raw = " ".join(seg.text for seg in segments).strip()
-    print(f"[{_ts()}] [AXIS Telegram] Whisper raw: {len(raw)} chars (lang={info.language})")
+    _vlog(f"whisper_done chars={len(raw)} lang={info.language}")
     return raw
 
 
@@ -249,44 +291,64 @@ def _fix_transcription(raw: str) -> str:
     return fixed or raw
 
 
-def _transcribe(input_path: str) -> str:
+async def _run_transcription(source: str, loop: asyncio.AbstractEventLoop) -> str:
     """
-    Blocking: normalize audio → Deepgram Nova-3 (if DEEPGRAM_API_KEY set)
-    or faster-whisper (fallback) → optional Claude correction.
-    Returns cleaned transcript string.
+    Async: attempt Deepgram (20 s) then Whisper fallback (30 s).
+    Returns transcript string. Returns "" if both fail. Never raises.
+    Emits _vlog() events at every stage.
     """
-    wav_path = None
-    try:
+    if DEEPGRAM_API_KEY:
+        _vlog("selected_backend=deepgram")
+        _vlog(f"deepgram_key_present=true")
+        _vlog("deepgram_request_start")
         try:
-            wav_path = _normalize_audio(input_path)
-            source   = wav_path
-        except Exception:
-            source = input_path
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, _transcribe_deepgram, source),
+                timeout=_DEEPGRAM_TIMEOUT,
+            )
+            if raw:
+                _vlog(f"deepgram_request_done chars={len(raw)}")
+                return raw
+            _vlog("deepgram_exception reason=empty_transcript")
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _vlog("deepgram_timeout")
+        except Exception as exc:
+            _vlog(f"deepgram_exception reason={type(exc).__name__}:{exc!s:.120}")
 
-        raw = ""
-        if DEEPGRAM_API_KEY:
-            try:
-                raw = _transcribe_deepgram(source)
-                print(f"[{_ts()}] [AXIS Telegram] Deepgram raw: {len(raw)} chars")
-            except Exception as exc:
-                print(f"[{_ts()}] [AXIS Telegram] Deepgram failed ({exc}) — falling back to Whisper")
-                raw = _transcribe_whisper(source)
-        else:
-            print(f"[{_ts()}] [AXIS Telegram] No DEEPGRAM_API_KEY — using faster-whisper")
-            raw = _transcribe_whisper(source)
-
-        if not raw:
+        # Whisper fallback
+        _vlog("selected_backend=whisper (deepgram_failed)")
+        _vlog("fallback_whisper_started")
+        try:
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, _transcribe_whisper, source),
+                timeout=_WHISPER_TIMEOUT,
+            )
+            _vlog(f"fallback_whisper_success chars={len(raw)}")
+            return raw or ""
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _vlog(f"whisper_timeout after={_WHISPER_TIMEOUT}s")
+            return ""
+        except Exception as exc:
+            _vlog(f"fallback_whisper_error reason={type(exc).__name__}:{exc!s:.120}")
             return ""
 
-        if VOICE_POSTPROCESS_WITH_CLAUDE:
-            fixed = _fix_transcription(raw)
-            print(f"[{_ts()}] [AXIS Telegram] After Claude correction: {len(fixed)} chars")
-            return fixed
-
-        return raw
-    finally:
-        if wav_path:
-            Path(wav_path).unlink(missing_ok=True)
+    else:
+        _vlog("deepgram_key_present=false")
+        _vlog("selected_backend=whisper (no_key)")
+        _vlog("whisper_start")
+        try:
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, _transcribe_whisper, source),
+                timeout=_WHISPER_TIMEOUT,
+            )
+            _vlog(f"whisper_done chars={len(raw)}")
+            return raw or ""
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _vlog(f"whisper_timeout after={_WHISPER_TIMEOUT}s")
+            return ""
+        except Exception as exc:
+            _vlog(f"fallback_whisper_error reason={type(exc).__name__}:{exc!s:.120}")
+            return ""
 
 
 # ---------------------------------------------------------------------------
@@ -431,48 +493,100 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _voice_inner(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    status,
+    uid: int,
+    request_id: str,
+) -> None:
+    """
+    Core voice pipeline.  Called inside a 60-second asyncio.wait_for guard.
+    Any exception propagates to handle_voice which always edits status.
+    """
+    loop     = asyncio.get_running_loop()
+    ogg_path: Optional[str] = None
+    wav_path: Optional[str] = None
+
+    try:
+        # ── Telegram download ───────────────────────────────────────────────
+        voice   = update.message.voice
+        _vlog(f"telegram_file_id_received file_id={voice.file_id}")
+        _vlog("telegram_file_download_start")
+        tg_file = await context.bot.get_file(voice.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            ogg_path = tmp.name
+        await tg_file.download_to_drive(ogg_path)
+        _vlog(f"telegram_file_download_done path={ogg_path}")
+
+        # ── ffmpeg normalize ────────────────────────────────────────────────
+        _vlog("ffmpeg_start")
+        try:
+            wav_path = await loop.run_in_executor(None, _normalize_audio, ogg_path)
+            source   = wav_path
+            _vlog("ffmpeg_done")
+        except Exception as exc:
+            _vlog(f"ffmpeg_failed reason={exc!s:.80} using_original=true")
+            source = ogg_path
+
+        # ── Transcription with timeouts ─────────────────────────────────────
+        text = await _run_transcription(source, loop)
+
+        if not text:
+            _vlog("transcription_empty — sending failure message")
+            await status.edit_text(_FAILURE_MSG)
+            return
+
+        _vlog(f"transcription_complete chars={len(text)}")
+        await status.edit_text(f'🎙 "{text}"\n\n⏳ Asking AXIS...')
+
+        # ── AXIS API ────────────────────────────────────────────────────────
+        _vlog("axis_request_start")
+        response_data = await asyncio.wait_for(
+            loop.run_in_executor(None, _call_axis_api, text, request_id),
+            timeout=_AXIS_TIMEOUT,
+        )
+        reply = _format_response(response_data)
+        _vlog("axis_request_done")
+
+        if len(reply) > 4000:
+            reply = reply[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
+        await status.edit_text(f'🎙 "{text}"\n\n{reply}')
+        _vlog("telegram_edit_done")
+
+    finally:
+        for path in (wav_path, ogg_path):
+            if path:
+                Path(path).unlink(missing_ok=True)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
 
     uid        = update.effective_user.id
     request_id = f"tg-{update.update_id}"
-    status     = await update.message.reply_text("🎙 Transcribing...")
-    ogg_path   = None
+    _vlog(f"voice_received uid={uid} update_id={update.update_id}")
+
+    status = await update.message.reply_text("🎙 Transcribing...")
+
     try:
-        voice   = update.message.voice
-        tg_file = await context.bot.get_file(voice.file_id)
-
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            ogg_path = tmp.name
-        await tg_file.download_to_drive(ogg_path)
-
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, _transcribe, ogg_path)
-
-        if not text:
-            await status.edit_text("⚠️ Could not transcribe audio. Please try again.")
-            return
-
-        print(f"[{_ts()}] [AXIS Telegram] voice uid={uid} update_id={update.update_id} "
-              f"→ transcribed: {text[:80]!r}")
-        await status.edit_text(f'🎙 "{text}"\n\n⏳ Asking AXIS...')
-
-        response = await _ask_axis(text, request_id=request_id)
-        if len(response) > 4000:
-            response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
-        await status.edit_text(f'🎙 "{text}"\n\n{response}')
-
-    except Exception as exc:
-        print(f"[{_ts()}] [AXIS Telegram] ERROR in voice handler: {exc}")
-        await status.edit_text(
-            f"⚠️ Error: {exc}\n\n"
-            f"API URL: {AXIS_API_URL}\n"
-            "Use /status to check connectivity."
+        await asyncio.wait_for(
+            _voice_inner(update, context, status, uid, request_id),
+            timeout=_VOICE_HANDLER_TIMEOUT,
         )
-    finally:
-        if ogg_path:
-            Path(ogg_path).unlink(missing_ok=True)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        _vlog(f"voice_handler_timeout after={_VOICE_HANDLER_TIMEOUT}s")
+        try:
+            await status.edit_text(_FAILURE_MSG)
+        except Exception:
+            pass
+    except Exception as exc:
+        _vlog(f"voice_handler_error reason={type(exc).__name__}:{exc!s:.120}")
+        try:
+            await status.edit_text(_FAILURE_MSG)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -496,11 +610,17 @@ def main():
     print(f"[AXIS Telegram] Starting — authorized UID: {AUTHORIZED_UID}")
     print(f"[AXIS Telegram] AXIS API URL : {AXIS_API_URL}")
     print(f"[AXIS Telegram] Health URL   : {AXIS_HEALTH_URL}")
+    dg_status = "set ✓" if DEEPGRAM_API_KEY else "NOT SET ← voice will use slow Whisper"
+    print(f"[AXIS Telegram] DEEPGRAM_API_KEY : {dg_status}")
     if DEEPGRAM_API_KEY:
-        print(f"[AXIS Telegram] STT backend  : Deepgram Nova-3 (Arabic) + Whisper fallback")
+        print(f"[AXIS Telegram] STT backend  : Deepgram Nova-3 + Whisper fallback "
+              f"(timeouts: dg={_DEEPGRAM_TIMEOUT}s whisper={_WHISPER_TIMEOUT}s)")
     else:
-        print(f"[AXIS Telegram] STT backend  : faster-whisper ({WHISPER_MODEL}) [no DEEPGRAM_API_KEY]")
-    print(f"[AXIS Telegram] Claude postprocess: {'on' if VOICE_POSTPROCESS_WITH_CLAUDE else 'off'}")
+        print(f"[AXIS Telegram] STT backend  : faster-whisper ({WHISPER_MODEL}) "
+              f"timeout={_WHISPER_TIMEOUT}s  [WARNING: cold load takes 40+ s]")
+    print(f"[AXIS Telegram] Voice handler timeout : {_VOICE_HANDLER_TIMEOUT}s total")
+    print(f"[AXIS Telegram] AXIS API timeout      : {_AXIS_TIMEOUT}s (voice)")
+    print(f"[AXIS Telegram] Claude postprocess    : {'on' if VOICE_POSTPROCESS_WITH_CLAUDE else 'off'}")
 
     _check_api_on_startup()
 
