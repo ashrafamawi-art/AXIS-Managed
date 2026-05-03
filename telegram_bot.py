@@ -69,6 +69,7 @@ _VOICE_HANDLER_TIMEOUT: int = 120  # total budget for handle_voice (background �
 _DEEPGRAM_TIMEOUT:      int = 20   # Deepgram API call
 _WHISPER_TIMEOUT:       int = 30   # Whisper model load + transcription
 _AXIS_TIMEOUT:          int = 60   # AXIS API call from voice handler
+_AXIS_TEXT_TIMEOUT:     int = 180  # AXIS API call from text handler (longer — no Telegram read-timeout racing)
 
 client         = anthropic.Anthropic(api_key=api_key)
 AUTHORIZED_UID = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else 0
@@ -88,7 +89,7 @@ def _ts() -> str:
 # AXIS API call — no fallback, no local Claude response for text
 # ---------------------------------------------------------------------------
 
-def _call_axis_api(text: str, request_id: str = "") -> dict:
+def _call_axis_api(text: str, request_id: str = "", timeout: int = _AXIS_TIMEOUT) -> dict:
     """
     Blocking: POST task to AXIS REST API.
     request_id is derived from Telegram's update_id — stable across retries,
@@ -100,14 +101,19 @@ def _call_axis_api(text: str, request_id: str = "") -> dict:
     if request_id:
         payload["request_id"] = request_id
 
-    print(f"[{_ts()}] [AXIS Telegram] → POST {AXIS_API_URL}")
-    print(f"[{_ts()}] [AXIS Telegram]   request_id={request_id or '(none)'}  "
-          f"task={text[:100]!r}")
+    fp = request_id or "(none)"
+    print(f"[axis_http_start] fp={fp} url={AXIS_API_URL} timeout={timeout}s task={text[:100]!r}")
 
-    resp = http_lib.post(AXIS_API_URL, json=payload, timeout=_AXIS_TIMEOUT)
+    try:
+        resp = http_lib.post(AXIS_API_URL, json=payload, timeout=timeout)
+    except http_lib.exceptions.Timeout:
+        print(f"[axis_http_timeout] fp={fp} timeout={timeout}s")
+        raise
+    except Exception as exc:
+        print(f"[axis_http_error] fp={fp} error={type(exc).__name__}:{exc!s:.80}")
+        raise
 
-    print(f"[{_ts()}] [AXIS Telegram] ← HTTP {resp.status_code} "
-          f"({resp.elapsed.total_seconds():.1f}s)")
+    print(f"[axis_http_done] fp={fp} http={resp.status_code} elapsed={resp.elapsed.total_seconds():.1f}s")
     resp.raise_for_status()
 
     data = resp.json()
@@ -167,9 +173,11 @@ def _format_response(data: dict) -> str:
 
 
 async def _ask_axis(text: str, request_id: str = "") -> str:
-    """Async wrapper: runs the blocking API call in a thread pool."""
+    """Async wrapper: runs the blocking API call in a thread pool (text path, 180 s budget)."""
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _call_axis_api, text, request_id)
+    data = await loop.run_in_executor(
+        None, _call_axis_api, text, request_id, _AXIS_TEXT_TIMEOUT
+    )
     return _format_response(data)
 
 
@@ -478,25 +486,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid        = update.effective_user.id
     request_id = f"tg-{update.update_id}"
-    print(f"[{_ts()}] [AXIS Telegram] text uid={uid} update_id={update.update_id}: {text[:80]!r}")
+    print(f"[telegram_received] fp={request_id} uid={uid} task={text[:80]!r}")
 
     thinking = await update.message.reply_text("⏳")
+    print(f"[telegram_ack_sent] fp={request_id}")
 
     async def _run():
+        print(f"[telegram_background_started] fp={request_id}")
         try:
             response = await _ask_axis(text, request_id=request_id)
             if len(response) > 4000:
                 response = response[:4000] + "\n\n⚠️ [تم اختصار الرد — الجواب كان أطول]"
+            print(f"[telegram_final_send_start] fp={request_id} chars={len(response)}")
             await thinking.edit_text(response)
+            print(f"[telegram_final_send_done] fp={request_id}")
+        except http_lib.exceptions.Timeout:
+            msg = f"⚠️ AXIS لم يرد في {_AXIS_TEXT_TIMEOUT}s — المهمة قد تكون طويلة جداً. جرب مرة أخرى."
+            print(f"[telegram_final_send_error] fp={request_id} reason=http_timeout")
+            await thinking.edit_text(msg)
         except Exception as exc:
-            print(f"[{_ts()}] [AXIS Telegram] ERROR calling AXIS API: {exc}")
+            print(f"[telegram_final_send_error] fp={request_id} reason={type(exc).__name__}:{exc!s:.80}")
             await thinking.edit_text(
-                f"⚠️ AXIS API error: {exc}\n\n"
+                f"⚠️ AXIS API error: {type(exc).__name__}\n\n"
                 f"API URL: {AXIS_API_URL}\n"
                 "Use /status to check connectivity."
             )
 
     asyncio.create_task(_run())
+    print(f"[telegram_background_task_created] fp={request_id}")
 
 
 async def _voice_inner(
