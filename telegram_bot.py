@@ -10,7 +10,7 @@ Timeouts (hard limits — user always sees a response):
   VOICE_HANDLER_TIMEOUT  60 s — total voice handler budget
   DEEPGRAM_TIMEOUT       20 s — Deepgram API call
   WHISPER_TIMEOUT        30 s — local Whisper transcription (inc. model load)
-  AXIS_TIMEOUT           20 s — AXIS API call for voice
+  AXIS_TIMEOUT           120 s — AXIS API call for voice
 
 Environment variables:
   TELEGRAM_TOKEN              Bot token from @BotFather
