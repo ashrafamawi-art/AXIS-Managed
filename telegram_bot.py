@@ -2,17 +2,23 @@
 AXIS Telegram Bot — voice and text interface to AXIS from any phone.
 
 Forwards every message to the AXIS REST API (POST /task) and returns
-the response. Voice notes are transcribed locally with faster-whisper
-(configurable model size) then cleaned up with Claude before sending.
+the response. Voice notes are transcribed with Deepgram Nova-3 (preferred)
+or faster-whisper (fallback when DEEPGRAM_API_KEY is not set or Deepgram fails).
+Claude post-processing is optional and off by default.
 
 Environment variables:
-  TELEGRAM_TOKEN       Bot token from @BotFather
-  TELEGRAM_USER_ID     Authorized user's Telegram numeric ID
-  ANTHROPIC_API_KEY    For Claude post-processing of Arabic transcription
-  AXIS_API_URL         Full URL of the AXIS /task endpoint
-                       Default: https://axis-api.onrender.com/task
-  WHISPER_MODEL        faster-whisper model size (default: small)
-                       tiny | base | small | medium | large-v3
+  TELEGRAM_TOKEN              Bot token from @BotFather
+  TELEGRAM_USER_ID            Authorized user's Telegram numeric ID
+  ANTHROPIC_API_KEY           For optional Claude post-processing of transcription
+  AXIS_API_URL                Full URL of the AXIS /task endpoint
+                              Default: https://axis-api.onrender.com/task
+  DEEPGRAM_API_KEY            Deepgram API key — enables Nova-3 Arabic transcription
+                              If unset, falls back to faster-whisper
+  WHISPER_MODEL               faster-whisper model size (default: small)
+                              tiny | base | small | medium | large-v3
+                              Only used when DEEPGRAM_API_KEY is not set or Deepgram fails
+  VOICE_POSTPROCESS_WITH_CLAUDE  Set to "true" to enable Claude Haiku post-correction
+                              Default: false (Deepgram accuracy is sufficient)
 """
 
 import asyncio
@@ -45,6 +51,8 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 api_key           = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_USER_ID  = os.environ.get("TELEGRAM_USER_ID", "")
+DEEPGRAM_API_KEY  = os.environ.get("DEEPGRAM_API_KEY", "").strip()
+VOICE_POSTPROCESS_WITH_CLAUDE = os.environ.get("VOICE_POSTPROCESS_WITH_CLAUDE", "false").lower() == "true"
 
 client         = anthropic.Anthropic(api_key=api_key)
 AUTHORIZED_UID = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else 0
@@ -148,8 +156,8 @@ async def _ask_axis(text: str, request_id: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Voice transcription — faster-whisper + Claude post-processing
-# (Claude is used ONLY here, to fix transcription errors, not to generate responses)
+# Voice transcription — Deepgram Nova-3 (primary) + faster-whisper (fallback)
+# Claude post-processing is optional: VOICE_POSTPROCESS_WITH_CLAUDE=true
 # ---------------------------------------------------------------------------
 
 _whisper_model = None
@@ -192,8 +200,38 @@ def _normalize_audio(input_path: str) -> str:
     return wav_path
 
 
+def _transcribe_deepgram(audio_path: str) -> str:
+    """
+    Transcribe using Deepgram Nova-3 Arabic (SDK v6+).
+    Returns transcript string or raises on failure.
+    """
+    from deepgram import DeepgramClient  # lazy import — only when key is set
+    dg = DeepgramClient(api_key=DEEPGRAM_API_KEY)
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    response = dg.listen.v1.media.transcribe_file(
+        request=audio_bytes,
+        model="nova-3",
+        language="ar",
+        smart_format=True,
+    )
+    transcript = response.results.channels[0].alternatives[0].transcript
+    return (transcript or "").strip()
+
+
+def _transcribe_whisper(audio_path: str) -> str:
+    """Transcribe using local faster-whisper. Returns transcript string."""
+    model = _get_whisper_model()
+    segments, info = model.transcribe(
+        audio_path, language="ar", beam_size=5, vad_filter=True,
+    )
+    raw = " ".join(seg.text for seg in segments).strip()
+    print(f"[{_ts()}] [AXIS Telegram] Whisper raw: {len(raw)} chars (lang={info.language})")
+    return raw
+
+
 def _fix_transcription(raw: str) -> str:
-    """Claude post-processing: fix Arabic transcription errors and names only."""
+    """Optional Claude Haiku post-processing: fix Arabic transcription errors."""
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
@@ -212,7 +250,11 @@ def _fix_transcription(raw: str) -> str:
 
 
 def _transcribe(input_path: str) -> str:
-    """Blocking: normalize → Whisper → Claude correction. Returns cleaned text."""
+    """
+    Blocking: normalize audio → Deepgram Nova-3 (if DEEPGRAM_API_KEY set)
+    or faster-whisper (fallback) → optional Claude correction.
+    Returns cleaned transcript string.
+    """
     wav_path = None
     try:
         try:
@@ -221,17 +263,27 @@ def _transcribe(input_path: str) -> str:
         except Exception:
             source = input_path
 
-        model = _get_whisper_model()
-        segments, info = model.transcribe(
-            source, language="ar", beam_size=5, vad_filter=True,
-        )
-        raw = " ".join(seg.text for seg in segments).strip()
-        print(f"[{_ts()}] [AXIS Telegram] Whisper raw: {len(raw)} chars (lang={info.language})")
+        raw = ""
+        if DEEPGRAM_API_KEY:
+            try:
+                raw = _transcribe_deepgram(source)
+                print(f"[{_ts()}] [AXIS Telegram] Deepgram raw: {len(raw)} chars")
+            except Exception as exc:
+                print(f"[{_ts()}] [AXIS Telegram] Deepgram failed ({exc}) — falling back to Whisper")
+                raw = _transcribe_whisper(source)
+        else:
+            print(f"[{_ts()}] [AXIS Telegram] No DEEPGRAM_API_KEY — using faster-whisper")
+            raw = _transcribe_whisper(source)
+
         if not raw:
             return ""
-        fixed = _fix_transcription(raw)
-        print(f"[{_ts()}] [AXIS Telegram] After correction: {len(fixed)} chars")
-        return fixed
+
+        if VOICE_POSTPROCESS_WITH_CLAUDE:
+            fixed = _fix_transcription(raw)
+            print(f"[{_ts()}] [AXIS Telegram] After Claude correction: {len(fixed)} chars")
+            return fixed
+
+        return raw
     finally:
         if wav_path:
             Path(wav_path).unlink(missing_ok=True)
@@ -444,7 +496,11 @@ def main():
     print(f"[AXIS Telegram] Starting — authorized UID: {AUTHORIZED_UID}")
     print(f"[AXIS Telegram] AXIS API URL : {AXIS_API_URL}")
     print(f"[AXIS Telegram] Health URL   : {AXIS_HEALTH_URL}")
-    print(f"[AXIS Telegram] Whisper model: {WHISPER_MODEL}")
+    if DEEPGRAM_API_KEY:
+        print(f"[AXIS Telegram] STT backend  : Deepgram Nova-3 (Arabic) + Whisper fallback")
+    else:
+        print(f"[AXIS Telegram] STT backend  : faster-whisper ({WHISPER_MODEL}) [no DEEPGRAM_API_KEY]")
+    print(f"[AXIS Telegram] Claude postprocess: {'on' if VOICE_POSTPROCESS_WITH_CLAUDE else 'off'}")
 
     _check_api_on_startup()
 
