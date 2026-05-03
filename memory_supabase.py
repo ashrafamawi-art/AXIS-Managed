@@ -212,3 +212,166 @@ def save_memory(task: str, content: str, ttl_days: int = 30) -> None:
     except Exception as exc:
         print(f"[memory] Supabase insert failed: {exc} — falling back to JSON")
         _legacy_save(task, content)
+
+
+# ---------------------------------------------------------------------------
+# Memory categories and smart save/retrieve
+# ---------------------------------------------------------------------------
+
+# DDL — run once in Supabase SQL editor to add category support:
+#
+#   alter table axis_memory
+#       add column if not exists category text not null default 'general';
+#
+#   create index if not exists axis_memory_category_idx
+#       on axis_memory (category);
+
+_CATEGORY_TTL: dict = {
+    "preferences":  365,
+    "projects":     180,
+    "contacts":     365,
+    "decisions":    90,
+    "tasks_history": 30,
+    "general":      30,
+}
+
+# Intent → category mapping for deterministic saves
+_INTENT_CATEGORY: dict = {
+    "memory_save":     "preferences",
+    "task_create":     "tasks_history",
+    "calendar_create": "tasks_history",
+}
+
+# Complexity → category for complex outcomes worth keeping
+_COMPLEXITY_CATEGORY: dict = {
+    "COMPLEX_PLANNING": "decisions",
+    "SELF_IMPROVEMENT": "decisions",
+}
+
+# Keywords that signal durable facts worth saving
+_DURABLE_SIGNALS = [
+    "تذكر", "احفظ", "اتفقنا", "قررنا", "قرار", "مشروع", "عميل",
+    "remember", "note that", "decided", "agreed", "project", "client",
+    "contact", "تواصل", "شريك", "partner",
+]
+
+
+def should_save(brain_output: dict, user_input: str) -> "tuple[bool, str]":
+    """
+    Decide whether the outcome of a request is worth persisting.
+
+    Returns (save: bool, category: str).
+    Never raises — defaults to (False, "") on any error.
+    """
+    try:
+        intent     = brain_output.get("intent", "")
+        complexity = brain_output.get("task_complexity", "")
+
+        # 1. Explicit intent-driven save
+        if intent in _INTENT_CATEGORY:
+            return True, _INTENT_CATEGORY[intent]
+
+        # 2. Complex planning outcomes → decisions worth keeping
+        if complexity in _COMPLEXITY_CATEGORY:
+            return True, _COMPLEXITY_CATEGORY[complexity]
+
+        # 3. Durable-fact signals in the user message
+        lower = user_input.lower()
+        if any(sig in lower for sig in _DURABLE_SIGNALS):
+            # Classify more precisely
+            if any(kw in lower for kw in ["عميل", "شريك", "client", "partner", "contact", "تواصل"]):
+                return True, "contacts"
+            if any(kw in lower for kw in ["مشروع", "project"]):
+                return True, "projects"
+            return True, "decisions"
+
+        # 4. Don't save ephemeral things: questions, briefings, general chat
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def save_with_category(topic: str, content: str, category: str) -> None:
+    """
+    Persist a memory entry with an explicit category and appropriate TTL.
+    Never raises.
+    """
+    ttl = _CATEGORY_TTL.get(category, 30)
+    db  = _get_client()
+    if db is None:
+        _legacy_save(topic, content)
+        return
+    try:
+        db.table(_TABLE).insert({
+            "topic":    _extract_topic(topic),
+            "content":  content[:500],
+            "tags":     _extract_tags(topic),
+            "ttl_days": ttl,
+            "category": category,
+        }).execute()
+    except Exception as exc:
+        print(f"[memory] save_with_category failed: {exc} — falling back to JSON")
+        _legacy_save(topic, content)
+
+
+def retrieve_relevant(query: str, n: int = 3) -> str:
+    """
+    Return a concise context string of the n most relevant non-expired memories.
+
+    Relevance = keyword overlap between the query and each row's tags + topic.
+    Falls back to most-recent entries when no overlap is found.
+    Never raises.
+    """
+    try:
+        keywords = set(_extract_tags(query))
+        db       = _get_client()
+        if db is None:
+            return _legacy_load(n)
+
+        resp = (
+            db.table(_TABLE)
+            .select("topic, content, tags, created_at, ttl_days")
+            .order("created_at", desc=True)
+            .limit(60)
+            .execute()
+        )
+        rows = resp.data or []
+        now  = datetime.now(timezone.utc)
+
+        # Filter expired, then score by keyword overlap
+        scored: list = []
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if (now - created).days > int(row.get("ttl_days") or 30):
+                    continue
+            except Exception:
+                continue
+
+            row_tags    = set(row.get("tags") or [])
+            topic_lower = row.get("topic", "").lower()
+            score       = len(keywords & row_tags)
+            score      += sum(1 for kw in keywords if kw in topic_lower)
+            scored.append((score, row))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # If best score is 0, fall back to most-recent n entries (already sorted)
+        top = [r for s, r in scored[:n] if s > 0] or [r for _, r in scored[:n]]
+
+        if not top:
+            return ""
+
+        lines = ["[Relevant Memory]"]
+        for row in top:
+            date_str = row["created_at"][:10]
+            lines.append(f"• [{date_str}] {row['topic']!r}")
+            if row.get("content"):
+                lines.append(f"  → {row['content'][:120]}")
+        return "\n".join(lines)
+
+    except Exception as exc:
+        print(f"[memory] retrieve_relevant failed: {exc}")
+        return _legacy_load(n)

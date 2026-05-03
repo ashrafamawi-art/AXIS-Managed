@@ -11,6 +11,7 @@ Usage:
 
 import json
 import os
+from typing import Optional
 
 import anthropic
 
@@ -168,14 +169,20 @@ class AXISBrain:
     def __init__(self) -> None:
         self._client = anthropic.Anthropic(api_key=_load_api_key())
 
-    def classify(self, user_input: str) -> dict:
-        """Classify user input and return a validated brain output dict."""
+    def classify(self, user_input: str, context: Optional[str] = None) -> dict:
+        """
+        Classify user input and return a validated brain output dict.
+        Pass relevant memory context to improve classification accuracy.
+        """
+        content = user_input
+        if context:
+            content = f"{user_input}\n\n[Relevant Memory Context]\n{context}"
         resp = self._client.messages.create(
             model=_MODEL,
             max_tokens=1024,
             temperature=0,
             system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_input}],
+            messages=[{"role": "user", "content": content}],
             output_config={"format": {"type": "json_schema", "schema": _BRAIN_SCHEMA}},
         )
         raw = json.loads(resp.content[0].text)

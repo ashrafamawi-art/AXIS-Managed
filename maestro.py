@@ -898,9 +898,12 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
             "timestamp": ts,
         }
 
-    # ── 2. Brain classification (replaces keyword router) ─────────────────
-    brain_output   = _brain.classify(actual_task)
-    intent         = brain_output["intent"]
+    # ── 2. Retrieve relevant memory context ──────────────────────────────
+    mem_context = _mem.retrieve_relevant(actual_task)
+
+    # ── 2b. Brain classification (replaces keyword router) ────────────────
+    brain_output    = _brain.classify(actual_task, context=mem_context or None)
+    intent          = brain_output["intent"]
     task_complexity = brain_output["task_complexity"]
 
     # MEDIUM risk without confirm → hold for user confirmation
@@ -983,8 +986,10 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
     agent_result = _synthesize(actual_task, step_results, exec_plan, client)
     agent_names  = [sr["agent"] for sr in step_results]
 
-    # ── 6. Persist to memory ──────────────────────────────────────────────
-    _save_memory(actual_task, agent_result.get("answer", ""))
+    # ── 6. Persist to memory (smart save — not blind) ────────────────────
+    _do_save, _category = _mem.should_save(brain_output, actual_task)
+    if _do_save:
+        _mem.save_with_category(actual_task, agent_result.get("answer", ""), _category)
 
     # ── 7. Build unified response ─────────────────────────────────────────
     response: dict = {
