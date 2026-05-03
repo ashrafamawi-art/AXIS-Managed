@@ -459,6 +459,9 @@ def voice_diag():
     }
 
 
+_TASK_TIMEOUT = 25.0  # seconds — must be less than Telegram bot's 60 s read timeout
+
+
 @app.post("/task")
 async def post_task(req: TaskRequest):
     task = req.task.strip()
@@ -472,13 +475,31 @@ async def post_task(req: TaskRequest):
         print(f"[server] returning cached result for fp={fp} task={task[:60]!r}")
         return cached
 
+    print(f"[axis_request_start] fp={fp} task={task[:80]!r}")
+
     try:
         loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, maestro.run, task, client
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, maestro.run, task, client),
+            timeout=_TASK_TIMEOUT,
         )
         result["request_id"] = fp
         _cache_set(fp, result)
+        print(f"[axis_request_success] fp={fp}")
         return result
+
+    except asyncio.TimeoutError:
+        print(f"[axis_request_timeout] fp={fp} task={task[:80]!r}")
+        return {
+            "status":     "timeout",
+            "message":    "Request took too long but is still processing.",
+            "request_id": fp,
+        }
+
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        print(f"[axis_request_error] fp={fp} error={exc!r}")
+        return {
+            "status":     "error",
+            "message":    "An error occurred processing the request.",
+            "request_id": fp,
+        }
