@@ -16,6 +16,8 @@ Environment variables:
   AXIS_DATA_DIR       (default: directory of this file)
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import os
