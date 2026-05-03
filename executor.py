@@ -79,6 +79,28 @@ def _load_gcal_creds():
 # ---------------------------------------------------------------------------
 
 def _send_notification(title: str, message: str, **_) -> str:
+    """Send a notification via Telegram (primary) or macOS (local fallback)."""
+    token   = os.environ.get("TELEGRAM_TOKEN", "")
+    user_id = os.environ.get("TELEGRAM_USER_ID", "")
+
+    if token and user_id:
+        text = f"🔔 *{title}*\n\n{message}"
+        try:
+            r = http_lib.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": user_id, "text": text, "parse_mode": "Markdown"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                print(f"[executor] notification sent via Telegram: {title!r}")
+                return f"Notification sent: {title!r}"
+            print(f"[executor] Telegram notification failed: HTTP {r.status_code}")
+            return f"Notification failed (HTTP {r.status_code}): {title!r}"
+        except Exception as exc:
+            print(f"[executor] Telegram notification error: {exc}")
+            return f"Notification failed ({type(exc).__name__}): {title!r}"
+
+    # Local fallback (macOS dev environment only)
     import re
     clean = lambda s: re.sub(r"[^\x00-\x7F]+", "", s).replace('"', '\\"').strip()
     try:
@@ -87,9 +109,9 @@ def _send_notification(title: str, message: str, **_) -> str:
              f'display notification "{clean(message)}" with title "{clean(title)}"'],
             capture_output=True, text=True,
         )
-        return f"Sent: {title!r}" if r.returncode == 0 else f"Notification queued: {title!r}"
+        return f"Notification sent: {title!r}" if r.returncode == 0 else f"Notification queued: {title!r}"
     except FileNotFoundError:
-        return f"Notification queued (no display): {title!r}"
+        return f"Notification queued (no Telegram token, no display): {title!r}"
 
 
 def _save_task(task: str = "", priority: str = "medium", due: str = "", **extra) -> str:
@@ -199,6 +221,18 @@ def _create_calendar_event(
 
         cal       = CalendarService(creds=creds)
         conflicts = cal.check_conflicts(start_dt, end_dt)
+
+        # Persistent dedup: if an event with exactly this title already exists
+        # in this time window (in Google Calendar), skip creation.
+        # The in-memory 30s guard only catches retries within the same process
+        # lifetime; this check makes idempotency durable across restarts.
+        title_lower = title.strip().lower()
+        for ev in conflicts:
+            if (ev.get("summary") or "").strip().lower() == title_lower:
+                fmt_time = start_dt.strftime("%a %b %-d at %-I:%M %p")
+                print(f"[executor] calendar: event already exists in Google Calendar: {title!r}")
+                return f"CALENDAR_EVENT_CREATED: '{title}' on {fmt_time}"
+
         conflict_note = ""
         if conflicts:
             names = [c.get("summary", "Untitled") for c in conflicts[:2]]
