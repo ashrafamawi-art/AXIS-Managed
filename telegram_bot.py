@@ -68,7 +68,7 @@ VOICE_POSTPROCESS_WITH_CLAUDE = (
 _VOICE_HANDLER_TIMEOUT: int = 60   # total budget for handle_voice
 _DEEPGRAM_TIMEOUT:      int = 20   # Deepgram API call
 _WHISPER_TIMEOUT:       int = 30   # Whisper model load + transcription
-_AXIS_TIMEOUT:          int = 20   # AXIS API call from voice handler
+_AXIS_TIMEOUT:          int = 60   # AXIS API call from voice handler
 
 client         = anthropic.Anthropic(api_key=api_key)
 AUTHORIZED_UID = int(TELEGRAM_USER_ID) if TELEGRAM_USER_ID else 0
