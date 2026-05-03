@@ -43,7 +43,7 @@ def _arabic_date(d) -> str:
 
 
 def _fmt_riyadh_time(raw_start: str) -> str:
-    """Return 'H:MM ص/م' for a Google Calendar dateTime string, else 'طوال اليوم'."""
+    """Return Arabic-formatted time 'H:MM AM/PM' for a dateTime string, or 'all day' label."""
     try:
         if "T" in raw_start:
             dt    = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
