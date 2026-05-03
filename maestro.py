@@ -29,6 +29,7 @@ import council
 import executor
 import memory_supabase as _mem
 import task_manager as _tm
+from brain import AXISBrain
 
 _SKIP_PREFIX = "__SKIP_CONFIRM__"
 
@@ -671,6 +672,29 @@ _AGENT_MAP = {
     "github":   github_agent,
 }
 
+_brain = AXISBrain()
+
+
+def _brain_to_plan(brain_output: dict, task: str) -> dict:
+    """Convert brain agent instructions into a maestro DAG plan."""
+    steps = []
+    for i, agent_inst in enumerate(brain_output.get("agents", [])):
+        agent_name = agent_inst["agent"]
+        # Map 'development' (brain concept) to 'github' (maestro agent)
+        if agent_name not in _AGENT_MAP:
+            agent_name = "general"
+        steps.append({
+            "id":          f"s{i + 1}",
+            "agent":       agent_name,
+            "description": agent_inst["action"],
+            "input":       task,
+            "depends_on":  [],
+        })
+    if not steps:
+        steps = [{"id": "s1", "agent": "general", "description": task,
+                  "input": task, "depends_on": []}]
+    return {"steps": steps, "rationale": f"brain:{brain_output['intent']}"}
+
 # ---------------------------------------------------------------------------
 # Orchestrator: plan → execute → synthesize
 # ---------------------------------------------------------------------------
@@ -874,8 +898,10 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
             "timestamp": ts,
         }
 
-    # ── 2. Classify intent ────────────────────────────────────────────────
-    intent = _classify_intent(actual_task, client)
+    # ── 2. Brain classification (replaces keyword router) ─────────────────
+    brain_output   = _brain.classify(actual_task)
+    intent         = brain_output["intent"]
+    task_complexity = brain_output["task_complexity"]
 
     # MEDIUM risk without confirm → hold for user confirmation
     if sec["risk"] == security.MEDIUM and not confirmed:
@@ -930,7 +956,23 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
             _tm.save(_task_rec)
 
     # ── 3. Build execution plan ───────────────────────────────────────────
-    exec_plan = _build_plan(actual_task, client)
+    if task_complexity == "SELF_IMPROVEMENT" and not confirmed:
+        return {
+            "id":        str(uuid.uuid4()),
+            "task":      actual_task,
+            "status":    "needs_confirmation",
+            "reason":    "self_improvement",
+            "message":   "⚠️ هذا الطلب يعدّل AXIS نفسه. رد بـ 'confirm' للمتابعة.",
+            "security":  {"risk": sec["risk"], "reason": sec["reason"]},
+            "routing":   {"intent": intent, "task_complexity": task_complexity},
+            "artifacts": {},
+            "timestamp": ts,
+        }
+
+    if task_complexity == "SIMPLE_EXECUTION":
+        exec_plan = _brain_to_plan(brain_output, actual_task)
+    else:
+        exec_plan = _build_plan(actual_task, client)
     t0 = time.monotonic()
 
     # ── 4. Execute plan (DAG-based, parallel-capable) ─────────────────────
@@ -952,7 +994,7 @@ def run(task: str, client: anthropic.Anthropic) -> dict:
         "agent":     ", ".join(agent_names),
         "answer":    agent_result.get("answer", "(no response)"),
         "security":  {"risk": sec["risk"], "reason": sec["reason"]},
-        "routing":   {"intent": intent, "agents": agent_names},
+        "routing":   {"intent": intent, "task_complexity": task_complexity, "agents": agent_names},
         "artifacts":    agent_result.get("artifacts", {}),
         "execution_ms": execution_ms,
         "timestamp":    ts,
