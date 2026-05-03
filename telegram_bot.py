@@ -180,6 +180,9 @@ async def _ask_axis(text: str, request_id: str = "") -> str:
 # Set DEEPGRAM_API_KEY in Render env vars to use Deepgram and avoid that delay.
 # ---------------------------------------------------------------------------
 
+_DEEPGRAM_TIMEOUT = 20   # seconds — asyncio.wait_for + SDK-level timeout
+_WHISPER_TIMEOUT  = 30   # seconds — asyncio.wait_for
+
 _whisper_model = None
 
 

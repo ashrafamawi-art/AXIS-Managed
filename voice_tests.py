@@ -288,3 +288,45 @@ def test_transcribe_deepgram_extracts_transcript():
             result = bot._transcribe_deepgram("/tmp/audio.wav")
 
     assert result == "اجتماع مع أحمد غداً"
+
+
+# ---------------------------------------------------------------------------
+# 8. handle_voice sends failure message when transcription returns empty
+# ---------------------------------------------------------------------------
+
+def test_handle_voice_sends_failure_on_empty_transcript():
+    """handle_voice edits the status message with a failure string when transcript is empty."""
+    status_mock = AsyncMock()
+
+    update_mock = MagicMock()
+    update_mock.effective_user.id = 12345
+    update_mock.update_id = 99
+    update_mock.message.voice.file_id = "file123"
+    update_mock.message.reply_text = AsyncMock(return_value=status_mock)
+
+    context_mock = MagicMock()
+    tg_file_mock = AsyncMock()
+    tg_file_mock.download_to_drive = AsyncMock()
+    context_mock.bot.get_file = AsyncMock(return_value=tg_file_mock)
+
+    async def go():
+        with (
+            patch.object(bot, "AUTHORIZED_UID", 12345),
+            patch.object(bot, "_normalize_audio", return_value="/tmp/test.wav"),
+            patch.object(bot, "_transcribe_async", return_value=""),
+            patch("pathlib.Path.unlink"),
+            patch("tempfile.NamedTemporaryFile", MagicMock(
+                return_value=MagicMock(
+                    __enter__=MagicMock(return_value=MagicMock(name="/tmp/fake.ogg")),
+                    __exit__=MagicMock(return_value=False),
+                )
+            )),
+        ):
+            await bot.handle_voice(update_mock, context_mock)
+
+    run(go())
+
+    # The status message must have been edited — user never left on "Transcribing..."
+    status_mock.edit_text.assert_called_once()
+    call_args = status_mock.edit_text.call_args[0][0]
+    assert "transcription failed" in call_args.lower() or "resend" in call_args.lower()
